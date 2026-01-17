@@ -1,0 +1,14 @@
+# Terraform (DO NOT COMMIT)
+**/.terraform/*
+**/*.tfstate
+**/*.tfstate.*
+crash.log
+*.tfvars
+
+# Node
+**/node_modules/
+**/dist/
+
+# Secrets
+.env
+.env.*
