@@ -1,6 +1,7 @@
 name: Deploy DEV (UI -> S3 + CloudFront)
 
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
     paths:
