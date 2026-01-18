@@ -16,3 +16,9 @@ variable "acm_certificate_arn" {
 variable "env" {
   type = string
 }
+
+variable "enable_tf_ui_deploy" {
+  description = "Whether Terraform should deploy UI artifacts (disabled when CI/CD is used)"
+  type        = bool
+  default     = false
+}
