@@ -1,0 +1,61 @@
+name: Deploy DEV (UI -> S3 + CloudFront)
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "ui/**"
+      - ".github/workflows/deploy-dev.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - site: dev-sanjaynishi
+            bucket: s3-llm-sre-dev-sanjaynishi
+            distribution_id: E26TJJZYWE0VUM
+          - site: dev-snrcs
+            bucket: s3-llm-sre-dev-snrcs
+            distribution_id: EI02N4OUI7JN9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (reads .nvmrc)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: "ui/.nvmrc"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - name: Install deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync to S3 (${{ matrix.site }})
+        run: |
+          aws s3 sync ui/dist s3://${{ matrix.bucket }}/ --delete
+
+      - name: Invalidate CloudFront cache (${{ matrix.site }})
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ matrix.distribution_id }} \
+            --paths "/*"
