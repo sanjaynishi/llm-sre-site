@@ -4,6 +4,7 @@
 **/*.tfstate.*
 crash.log
 *.tfvars
+terraform.tfstate.backup
 
 # Node
 **/node_modules/
