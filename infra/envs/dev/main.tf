@@ -16,4 +16,9 @@ module "site" {
   aws_region          = var.aws_region
   acm_certificate_arn = var.acm_certificate_arn
   env                 = "dev"
+
+  domains = toset([
+    "dev.sanjaynishi.com",
+    "dev.snrcs.com"
+  ])
 }

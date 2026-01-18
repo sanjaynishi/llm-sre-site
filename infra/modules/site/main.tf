@@ -12,23 +12,28 @@ provider "aws" {
   region = var.aws_region
 }
 
+########################################
+# Locals
+########################################
 locals {
-  # Convert domains into the exact bucket names you asked for:
-  # sanjaynishi.com -> s3-llm-sre-sanjaynishi
-  # snrcs.com       -> s3-llm-sre-snrcs
-  bucket_name_by_domain = {
+  # Convert domains to safe bucket slugs
+  # sanjaynishi.com      -> sanjaynishi
+  # dev.sanjaynishi.com  -> dev-sanjaynishi
+  domain_slug = {
     for d in var.domains :
-    d => "s3-llm-sre-${replace(d, ".com", "")}"
+    d => replace(replace(d, ".com", ""), ".", "-")
   }
 }
 
-# -----------------------
-# S3 buckets (private)
-# -----------------------
+########################################
+# S3 Buckets (Private)
+########################################
 resource "aws_s3_bucket" "site" {
   for_each = var.domains
 
-  bucket = var.env == "prod" ? "s3-llm-sre-${replace(each.value, ".com", "")}" : "s3-llm-sre-${var.env}-${replace(each.value, ".com", "")}"
+  # PROD keeps existing bucket names (NO CHANGE)
+  # DEV gets env-prefixed buckets
+  bucket = var.env == "prod" ? "s3-llm-sre-${local.domain_slug[each.value]}" : "s3-llm-sre-${var.env}-${replace(local.domain_slug[each.value], "${var.env}-", "")}"
 
   tags = {
     Project = "llm-sre"
@@ -82,7 +87,9 @@ resource "aws_cloudfront_distribution" "cdn" {
 
   # Apex only for now (as per your current plan)
   #aliases = [each.key]
-  aliases = [each.key, "www.${each.key}"]
+  #aliases = [each.key, "www.${each.key}"]
+
+ aliases = var.env == "prod" ? concat([each.key], ["www.${each.key}"]) : [each.key]
 
   origin {
     domain_name              = each.value.bucket_regional_domain_name
