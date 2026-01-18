@@ -28,10 +28,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (reads .nvmrc)
+      - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
-          node-version-file: "ui/.nvmrc"
+          node-version-file: "22"
           cache: "npm"
           cache-dependency-path: "ui/package-lock.json"
 
