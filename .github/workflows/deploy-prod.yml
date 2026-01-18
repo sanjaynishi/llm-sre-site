@@ -1,0 +1,64 @@
+name: Deploy PROD (UI -> S3 + CloudFront) [Manual + Approval]
+
+on:
+  workflow_dispatch:
+    inputs:
+      invalidate_cache:
+        description: "Invalidate CloudFront cache (recommended: true)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    strategy:
+      matrix:
+        include:
+          - site: prod-sanjaynishi
+            bucket: s3-llm-sre-sanjaynishi
+            distribution_id: E2LNYMBUFKO9JO
+          - site: prod-snrcs
+            bucket: s3-llm-sre-snrcs
+            distribution_id: E3KNFFIC28DU6L
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - name: Install deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync to S3 (${{ matrix.site }})
+        run: |
+          aws s3 sync ui/dist s3://${{ matrix.bucket }}/ --delete
+
+      - name: Invalidate CloudFront cache (${{ matrix.site }})
+        if: ${{ inputs.invalidate_cache == 'true' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ matrix.distribution_id }} \
+            --paths "/*"
