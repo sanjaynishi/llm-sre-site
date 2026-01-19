@@ -1,35 +1,30 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import React, { useState } from "react";
+import Agents from "./pages/Agents";
+import Runbooks from "./pages/Runbooks";
+import "./App.css";
 
-function App() {
-  const [count, setCount] = useState(0)
+export default function App() {
+  const [tab, setTab] = useState("runbooks");
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.jsx</code> and save to test HMR
+    <div>
+      <header style={{ padding: 16, borderBottom: "1px solid #eee" }}>
+        <h1 style={{ margin: 0 }}>AIML LLM SRE / DevOps</h1>
+        <p style={{ margin: "6px 0 0", opacity: 0.8 }}>
+          Azure OpenAI first • AWS AI next • Runbooks + Agentic tools
         </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
-}
 
-export default App
+        <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+          <button onClick={() => setTab("runbooks")} disabled={tab === "runbooks"}>
+            Runbooks (RAG)
+          </button>
+          <button onClick={() => setTab("agents")} disabled={tab === "agents"}>
+            Agentic AI
+          </button>
+        </div>
+      </header>
+
+      {tab === "runbooks" ? <Runbooks /> : <Agents />}
+    </div>
+  );
+}

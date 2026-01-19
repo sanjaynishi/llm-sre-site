@@ -12,34 +12,48 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_caller_identity" "current" {}
+
 ########################################
 # Locals
 ########################################
 locals {
   # Convert domains to safe bucket slugs
-  # sanjaynishi.com      -> sanjaynishi
-  # dev.sanjaynishi.com  -> dev-sanjaynishi
   domain_slug = {
     for d in var.domains :
     d => replace(replace(d, ".com", ""), ".", "-")
   }
+
+  # Stable map for for_each keys
+  domains_map = { for d in var.domains : d => d }
+}
+
+########################################
+# CloudFront managed policies
+########################################
+data "aws_cloudfront_cache_policy" "caching_disabled" {
+  name = "Managed-CachingDisabled"
+}
+
+data "aws_cloudfront_origin_request_policy" "all_viewer_except_host" {
+  name = "Managed-AllViewerExceptHostHeader"
 }
 
 ########################################
 # S3 Buckets (Private)
 ########################################
 resource "aws_s3_bucket" "site" {
-  for_each = var.domains
+  for_each = local.domains_map
 
-  # PROD keeps existing bucket names (NO CHANGE)
-  # DEV gets env-prefixed buckets
-  bucket = var.env == "prod" ? "s3-llm-sre-${local.domain_slug[each.value]}" : "s3-llm-sre-${var.env}-${replace(local.domain_slug[each.value], "${var.env}-", "")}"
+  # IMPORTANT: wrap multiline ternary in parentheses so HCL parses it correctly
+  bucket = (
+    var.env == "prod"
+    ? "s3-llm-sre-${local.domain_slug[each.key]}"
+    : "s3-llm-sre-${var.env}-${replace(local.domain_slug[each.key], "${var.env}-", "")}"
+  )
 
   tags = {
-    Project = "llm-sre"
-    Env     = var.env
-    Domain  = each.value
-    Owner   = "sanjay"
+    Domain = each.key
   }
 }
 
@@ -53,9 +67,9 @@ resource "aws_s3_bucket_public_access_block" "site" {
   restrict_public_buckets = true
 }
 
-# Upload placeholder content so CloudFront returns 200
+# Upload placeholder content so CloudFront returns 200 (optional)
 resource "aws_s3_object" "placeholder" {
-  for_each     = aws_s3_bucket.site
+  for_each     = var.enable_placeholder ? aws_s3_bucket.site : {}
   bucket       = each.value.id
   key          = "index.html"
   source       = "${path.module}/../../placeholder/index.html"
@@ -63,9 +77,9 @@ resource "aws_s3_object" "placeholder" {
   content_type = "text/html"
 }
 
-# -----------------------
+########################################
 # CloudFront OAC (recommended)
-# -----------------------
+########################################
 resource "aws_cloudfront_origin_access_control" "oac" {
   for_each                          = aws_s3_bucket.site
   name                              = "${each.key}-oac"
@@ -74,9 +88,9 @@ resource "aws_cloudfront_origin_access_control" "oac" {
   signing_protocol                  = "sigv4"
 }
 
-# -----------------------
+########################################
 # CloudFront distributions (one per domain)
-# -----------------------
+########################################
 resource "aws_cloudfront_distribution" "cdn" {
   for_each = aws_s3_bucket.site
 
@@ -85,18 +99,63 @@ resource "aws_cloudfront_distribution" "cdn" {
   comment             = "CDN for ${each.key}"
   default_root_object = "index.html"
 
-  # Apex only for now (as per your current plan)
-  #aliases = [each.key]
-  #aliases = [each.key, "www.${each.key}"]
+  aliases = var.env == "prod" ? concat([each.key], ["www.${each.key}"]) : [each.key]
 
- aliases = var.env == "prod" ? concat([each.key], ["www.${each.key}"]) : [each.key]
-
+  # -----------------------
+  # S3 origin (REST endpoint) + OAC
+  # -----------------------
   origin {
     domain_name              = each.value.bucket_regional_domain_name
     origin_id                = "s3-${each.key}"
     origin_access_control_id = aws_cloudfront_origin_access_control.oac[each.key].id
+
+    # IMPORTANT for OAC + S3 REST origins
+    s3_origin_config {
+      origin_access_identity = ""
+    }
   }
 
+  # -----------------------
+  # API Gateway origin (/api/*) - optional
+  # -----------------------
+  dynamic "origin" {
+    for_each = var.api_domain_name != "" ? [1] : []
+    content {
+      domain_name = var.api_domain_name
+      origin_id   = "api-${each.key}"
+
+      custom_origin_config {
+        http_port              = 80
+        https_port             = 443
+        origin_protocol_policy = "https-only"
+        origin_ssl_protocols   = ["TLSv1.2"]
+      }
+    }
+  }
+
+  # ============================================================
+  # Static assets MUST NOT be rewritten to index.html
+  # Keep this ordered behavior
+  # ============================================================
+  ordered_cache_behavior {
+    path_pattern           = "/assets/*"
+    target_origin_id       = "s3-${each.key}"
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS"]
+    cached_methods  = ["GET", "HEAD", "OPTIONS"]
+
+    compress = true
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+  }
+
+  # -----------------------
+  # Default (SPA pages)
+  # -----------------------
   default_cache_behavior {
     target_origin_id       = "s3-${each.key}"
     viewer_protocol_policy = "redirect-to-https"
@@ -112,14 +171,30 @@ resource "aws_cloudfront_distribution" "cdn" {
     }
   }
 
-  # React SPA-friendly behavior: map 403/404 to index.html
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 0
+  # -----------------------
+  # Route /api/* to API Gateway - optional
+  # -----------------------
+  dynamic "ordered_cache_behavior" {
+    for_each = var.api_domain_name != "" ? [1] : []
+    content {
+      path_pattern           = "/api/*"
+      target_origin_id       = "api-${each.key}"
+      viewer_protocol_policy = "redirect-to-https"
+
+      allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods  = ["GET", "HEAD", "OPTIONS"]
+
+      compress = true
+
+      cache_policy_id          = data.aws_cloudfront_cache_policy.caching_disabled.id
+      origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host.id
+    }
   }
 
+  # ============================================================
+  # SPA-friendly behavior: ONLY 404 → index.html
+  # (Do NOT map 403 → index.html)
+  # ============================================================
   custom_error_response {
     error_code            = 404
     response_code         = 200
@@ -138,9 +213,9 @@ resource "aws_cloudfront_distribution" "cdn" {
   }
 }
 
-# -----------------------
+########################################
 # Bucket policy: allow ONLY CloudFront distribution to read objects
-# -----------------------
+########################################
 data "aws_iam_policy_document" "allow_cf_read" {
   for_each = aws_s3_bucket.site
 
