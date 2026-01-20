@@ -164,6 +164,7 @@ export default function Agents() {
   const [err, setErr] = useState("");
   const [showRaw, setShowRaw] = useState(false);
 
+  // 1) Load catalog once
   useEffect(() => {
     let mounted = true;
 
@@ -195,6 +196,16 @@ export default function Agents() {
       mounted = false;
     };
   }, []);
+
+  // 2) Auto-select valid location when agent changes
+  useEffect(() => {
+    if (!agent) return;
+
+    const firstLocation = agent.allowed_locations?.[0] || "";
+    if (firstLocation && firstLocation !== location) {
+      setLocation(firstLocation);
+    }
+  }, [agentId, agent]); // (optionally add `location` if you want)
 
   const agent = useMemo(() => {
     return catalog?.agents?.find((a) => a.id === agentId);
