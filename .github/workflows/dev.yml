@@ -18,8 +18,16 @@ jobs:
   deploy-dev:
     runs-on: ubuntu-latest
     environment: dev
-
+    permissions:
+      id-token: write
+      contents: read
     steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-dev
+          aws-region: us-east-1
+
       - name: Checkout
         uses: actions/checkout@v4
 
