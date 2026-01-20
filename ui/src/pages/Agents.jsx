@@ -164,18 +164,12 @@ export default function Agents() {
   const [err, setErr] = useState("");
   const [showRaw, setShowRaw] = useState(false);
 
-  // 1) Auto-select valid location when agent changes
-  useEffect(() => {
-    if (!agent) return;
+  // ✅ Compute selected agent FIRST (avoid "agent is not defined" crash)
+  const agent = useMemo(() => {
+    return catalog?.agents?.find((a) => a.id === agentId);
+  }, [catalog, agentId]);
 
-    const firstLocation = agent.allowed_locations?.[0] || "";
-    if (firstLocation && firstLocation !== location) {
-      setLocation(firstLocation);
-    }
-  }, [agentId, agent]); // (optionally add `location` if you want)
-
-
-  // 2) Load catalog once
+  // 1) Load catalog once
   useEffect(() => {
     let mounted = true;
 
@@ -189,6 +183,7 @@ export default function Agents() {
 
         setCatalog(data);
 
+        // pick first agent + first allowed location safely
         const first = data?.agents?.[0];
         const initialAgentId = first?.id || "agent-weather";
         const initialLocation = first?.allowed_locations?.[0] || "";
@@ -208,15 +203,34 @@ export default function Agents() {
     };
   }, []);
 
+  // 2) When agent changes:
+  //    - clear previous result/error
+  //    - auto-select the first allowed location if current isn't valid
+  useEffect(() => {
+    if (!agent) return;
 
-  const agent = useMemo(() => {
-    return catalog?.agents?.find((a) => a.id === agentId);
-  }, [catalog, agentId]);
+    setErr("");
+    setResult(null);
+    setShowRaw(false);
+
+    const allowed = agent?.allowed_locations ?? [];
+    if (!allowed.length) {
+      setLocation("");
+      return;
+    }
+
+    // If current location isn't allowed for this agent, set the first allowed
+    if (!allowed.includes(location)) {
+      setLocation(allowed[0]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId, agent]); // intentionally not depending on `location` to avoid loops
 
   async function runAgent() {
     setErr("");
     setResult(null);
     setShowRaw(false);
+
     try {
       const data = await apiPost("/api/agent/run", {
         agent_id: agentId,
@@ -248,7 +262,7 @@ export default function Agents() {
       <h2 style={headerStyle}>Agentic AI</h2>
       <p style={subStyle}>
         Select an agent and run it. Output is displayed inline (no popups). Weather uses Open-Meteo;
-        Travel uses OpenAI (gpt-5.1-mini).
+        Travel uses OpenAI.
       </p>
 
       {err && <div style={errorStyle}>Error: {err}</div>}
@@ -269,7 +283,7 @@ export default function Agents() {
           <div>
             <label style={labelStyle}>{agentId === "agent-travel" ? "City" : "Location"}</label>
             <select value={location} onChange={(e) => setLocation(e.target.value)} style={selectStyle}>
-              {(agent?.allowed_locations || []).map((loc) => (
+              {(agent?.allowed_locations ?? []).map((loc) => (
                 <option key={loc} value={loc}>
                   {loc}
                 </option>
@@ -288,7 +302,11 @@ export default function Agents() {
           <button
             onClick={() => setShowRaw((s) => !s)}
             disabled={!result}
-            style={!result ? disabledButtonStyle : { ...buttonStyle, background: "#111827", borderColor: "#111827" }}
+            style={
+              !result
+                ? disabledButtonStyle
+                : { ...buttonStyle, background: "#111827", borderColor: "#111827" }
+            }
             title="Show/hide raw JSON (inline)"
           >
             {showRaw ? "Hide raw JSON" : "Show raw JSON"}
@@ -352,7 +370,6 @@ export default function Agents() {
             {/* -------- Pretty Travel -------- */}
             {isTravel && (
               <div style={{ marginTop: 12 }}>
-                {/* Weather outlook */}
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <span style={badgeStyle("#eef2ff", "#3730a3")}>
                     Next 2 days: {travelPlan?.weather_outlook?.next_2_days || "—"}
@@ -362,8 +379,14 @@ export default function Agents() {
                   </span>
                 </div>
 
-                {/* Itineraries in different colors */}
-                <div style={{ marginTop: 12, display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" }}>
+                <div
+                  style={{
+                    marginTop: 12,
+                    display: "grid",
+                    gap: 12,
+                    gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+                  }}
+                >
                   <div style={listCard("#f0fdf4")}>
                     <div style={{ ...sectionTitle, color: "#166534" }}>2-Day Itinerary</div>
                     <ol style={{ margin: 0, paddingLeft: 18 }}>
@@ -387,7 +410,6 @@ export default function Agents() {
                   </div>
                 </div>
 
-                {/* Costs */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ ...sectionTitle, marginBottom: 8 }}>Estimated Cost (USD)</div>
                   <div style={grid2}>
@@ -410,7 +432,6 @@ export default function Agents() {
                   </div>
                 </div>
 
-                {/* Tips */}
                 <div style={{ marginTop: 12, ...listCard("#fff7ed") }}>
                   <div style={{ ...sectionTitle, color: "#9a3412" }}>Travel Tips</div>
                   <ul style={{ margin: 0, paddingLeft: 18 }}>
@@ -422,7 +443,6 @@ export default function Agents() {
                   </ul>
                 </div>
 
-                {/* If travel_plan returned an error */}
                 {travelPlan?.error && (
                   <div style={{ ...errorStyle, marginTop: 12 }}>
                     Travel agent error: {String(travelPlan.error)}
@@ -431,7 +451,6 @@ export default function Agents() {
               </div>
             )}
 
-            {/* Raw JSON toggle (inline) */}
             {showRaw && (
               <div style={{ marginTop: 12 }}>
                 <div style={{ ...sectionTitle, marginBottom: 8 }}>Raw JSON</div>
@@ -456,7 +475,6 @@ export default function Agents() {
         )}
       </div>
 
-      {/* footer note */}
       <p style={{ marginTop: 14, color: "#6b7280", fontSize: 12 }}>
         Tip: Select <b>Travel planner</b> from the Agent dropdown to see travel output.
       </p>
