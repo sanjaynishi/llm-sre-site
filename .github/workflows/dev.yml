@@ -12,10 +12,12 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TF_IN_AUTOMATION: "true"
+  TF_VAR_acm_certificate_arn: ${{ secrets.TF_VAR_acm_certificate_arn_dev }}
 
 jobs:
   deploy-dev:
     runs-on: ubuntu-latest
+    environment: dev
 
     steps:
       - name: Checkout
@@ -55,7 +57,7 @@ jobs:
 
       - name: Terraform Apply (DEV)
         working-directory: infra/envs/dev
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve -input=false
 
       # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
       # These use outputs from Terraform so we always deploy to the right bucket & distribution.

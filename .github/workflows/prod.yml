@@ -12,10 +12,12 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TF_IN_AUTOMATION: "true"
+  TF_VAR_acm_certificate_arn: ${{ secrets.TF_VAR_acm_certificate_arn_prod }}
 
 jobs:
   deploy-prod:
     runs-on: ubuntu-latest
+    environment: prod
 
     steps:
       - name: Checkout
@@ -53,7 +55,7 @@ jobs:
 
       - name: Terraform Apply (PROD)
         working-directory: infra/envs/prod
-        run: terraform apply -auto-approve
+        run: terraform apply -auto-approve -input=false
 
       - name: Read Terraform outputs (PROD)
         id: tfout
