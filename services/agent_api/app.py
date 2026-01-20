@@ -5,7 +5,7 @@ Endpoints (behind CloudFront /api/*):
   GET  /api/agents        -> returns agent catalog
   POST /api/agent/run     -> runs a selected agent:
        - agent-weather (Open-Meteo)
-       - agent-travel  (OpenAI)  [fails gracefully if OpenAI SDK/key missing]
+       - agent-travel  (OpenAI over HTTPS, no SDK required)
   OPTIONS *               -> CORS preflight
 """
 
@@ -17,13 +17,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict
-
-# -------- Optional OpenAI import (DO NOT break Lambda if missing) ----------
-try:
-    from openai import OpenAI  # type: ignore
-except Exception:
-    OpenAI = None  # OpenAI SDK not packaged in Lambda zip
+from typing import Any
 
 
 # --- Config / Guardrails ------------------------------------------------------
@@ -55,7 +49,7 @@ AGENT_ID_WEATHER = "agent-weather"
 AGENT_ID_TRAVEL = "agent-travel"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1-mini")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1-mini").strip()
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -63,9 +57,7 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1-mini")
 def _pick_cors_origin(event: dict) -> str:
     headers = event.get("headers") or {}
     origin = headers.get("origin") or headers.get("Origin")
-    if origin and origin in ALLOWED_ORIGINS:
-        return origin
-    return "*" if not origin else "*"
+    return origin if origin in ALLOWED_ORIGINS else "*"
 
 
 def _json_response(event: dict, status_code: int, body: dict, extra_headers: dict | None = None) -> dict:
@@ -75,6 +67,7 @@ def _json_response(event: dict, status_code: int, body: dict, extra_headers: dic
         "Access-Control-Allow-Origin": cors_origin,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
     }
     if extra_headers:
         headers.update(extra_headers)
@@ -105,7 +98,7 @@ def _get_body_json(event: dict) -> dict:
         raise ValueError(f"Invalid JSON body: {e}") from e
 
 
-def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
+def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "llm-sre-agent/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
@@ -117,6 +110,40 @@ def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
         raise RuntimeError(f"HTTP {e.code} calling upstream: {url} :: {detail}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error calling upstream: {url} :: {e}") from e
+
+
+def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "User-Agent": "llm-sre-agent/1.0"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:800] + "...") if len(detail) > 800 else detail
+        raise RuntimeError(f"HTTP {e.code} POST {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error POST {url} :: {e}") from e
+
+
+def _extract_json_object(text: str) -> str:
+    """
+    Best-effort: if model adds stray text, try to extract the first JSON object.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return text
+    return text[start : end + 1]
 
 
 # --- Open-Meteo Calls ---------------------------------------------------------
@@ -203,22 +230,11 @@ def fetch_weather(lat: float, lon: float) -> dict:
     return _http_get_json(url)
 
 
-# --- OpenAI Travel ------------------------------------------------------------
-
-def _openai_client():
-    if OpenAI is None:
-        raise RuntimeError("OpenAI SDK is not packaged in this Lambda build")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not configured")
-    return OpenAI(api_key=OPENAI_API_KEY)
-
+# --- OpenAI Travel (stdlib-only HTTPS) ----------------------------------------
 
 def get_travel_info(city: str) -> dict:
-    # Fail gracefully so catalog/weather never break
-    try:
-        client = _openai_client()
-    except Exception as e:
-        return {"error": str(e)}
+    if not OPENAI_API_KEY:
+        return {"error": "OPENAI_API_KEY not configured"}
 
     prompt = f"""
 You are a travel planning assistant.
@@ -248,34 +264,51 @@ Rules:
 - Assume travel from a major US city
 - Costs approximate; total = sum of parts
 - No markdown; JSON only
-"""
+""".strip()
 
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-        max_output_tokens=650,
-    )
-
-    # Extract JSON text robustly
-    raw_text = getattr(resp, "output_text", None)
-    if raw_text is None:
-        raw_text = ""
-        for item in getattr(resp, "output", []) or []:
-            if item.get("type") == "message":
-                for content in item.get("content", []):
-                    if content.get("type") == "output_text":
-                        raw_text += content.get("text", "")
-    raw_text = (raw_text or "").strip()
+    # OpenAI Responses API (no SDK): https://api.openai.com/v1/responses
+    url = "https://api.openai.com/v1/responses"
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        # keep output size controlled
+        "max_output_tokens": 650,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
     try:
-        data = json.loads(raw_text)
+        resp = _http_post_json(url, payload, headers=headers, timeout_sec=25)
+    except Exception as e:
+        return {"error": f"OpenAI call failed: {str(e)}"}
+
+    # Extract output text
+    output_text = ""
+    for item in resp.get("output", []) or []:
+        if item.get("type") == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") in ("output_text", "text"):
+                    output_text += c.get("text", "")
+
+    output_text = output_text.strip()
+    if not output_text:
+        # Fallback: some responses might have a top-level field in future variants
+        output_text = (resp.get("output_text") or "").strip()
+
+    # Parse JSON (best-effort extraction)
+    candidate = _extract_json_object(output_text)
+    try:
+        data = json.loads(candidate)
     except json.JSONDecodeError:
-        return {"error": "Failed to parse JSON from model", "raw_output": raw_text[:1200]}
+        return {"error": "Failed to parse JSON from model", "raw_output": output_text[:1200]}
 
     # Sanity-check total
     try:
         c = data.get("estimated_cost_usd", {})
-        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(c.get("local_transport_food", 0))
+        parts = (
+            float(c.get("flights_for_2", 0))
+            + float(c.get("hotel_4_star_5_nights", 0))
+            + float(c.get("local_transport_food", 0))
+        )
         c["total"] = round(parts, 0)
         data["estimated_cost_usd"] = c
     except Exception:
@@ -321,15 +354,19 @@ def _handle_post_agent_run(event: dict) -> dict:
     if agent_id == AGENT_ID_WEATHER:
         if location not in ALLOWED_LOCATIONS:
             return _json_response(event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}})
+
         geo = geocode_location(location)
+        if geo.get("lat") is None or geo.get("lon") is None:
+            return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
+
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
         return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
 
     if agent_id == AGENT_ID_TRAVEL:
-        # For travel, "location" is city
         city = location.strip()
         if city not in TRAVEL_CITIES:
             return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
+
         travel = get_travel_info(city)
         return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
 
@@ -345,9 +382,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
     if method == "OPTIONS":
         return _json_response(event, 200, {"ok": True})
 
+    # works for /agents or /api/agents
     if method == "GET" and path.endswith("/agents"):
         return _handle_get_agents(event)
 
+    # works for /agent/run or /api/agent/run
     if method == "POST" and path.endswith("/agent/run"):
         try:
             return _handle_post_agent_run(event)
