@@ -2,7 +2,7 @@ name: Deploy DEV
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch: {}
 
 permissions:
@@ -10,33 +10,25 @@ permissions:
   contents: read
 
 env:
+  TF_IN_AUTOMATION: "true"
   TF_VAR_env: dev
-  TF_VAR_AWS_REGION: us-east-1
-  TF_VAR_TF_IN_AUTOMATION: "true"
+  TF_VAR_aws_region: us-east-1
   TF_VAR_acm_certificate_arn: ${{ secrets.TF_VAR_acm_certificate_arn_dev }}
 
 jobs:
   deploy-dev:
     runs-on: ubuntu-latest
     environment: dev
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-dev
-          aws-region: us-east-1
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Configure AWS creds (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-dev
+          aws-region: ${{ env.TF_VAR_aws_region }}
 
       # ---------- UI BUILD ----------
       - name: Setup Node
@@ -69,7 +61,6 @@ jobs:
         run: terraform apply -auto-approve -input=false
 
       # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
-      # These use outputs from Terraform so we always deploy to the right bucket & distribution.
       - name: Read Terraform outputs (DEV)
         id: tfout
         working-directory: infra/envs/dev
@@ -78,11 +69,7 @@ jobs:
           echo "CF_DIST_ID=$(terraform output -raw cloudfront_dist_id_dev)" >> $GITHUB_OUTPUT
 
       - name: Sync UI to S3
-        run: |
-          aws s3 sync ui/dist s3://${{ steps.tfout.outputs.S3_BUCKET }}/ --delete
+        run: aws s3 sync ui/dist s3://${{ steps.tfout.outputs.S3_BUCKET }}/ --delete
 
       - name: Invalidate CloudFront
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ steps.tfout.outputs.CF_DIST_ID }} \
-            --paths "/*"
+        run: aws cloudfront create-invalidation --distribution-id ${{ steps.tfout.outputs.CF_DIST_ID }} --paths "/*"
