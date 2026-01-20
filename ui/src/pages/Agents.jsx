@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { apiGet, apiPost } from "../api/client";
 
+/**
+ * Simple inline theme (no external CSS needed).
+ */
 const selectStyle = {
   minWidth: 320,
   padding: "10px 12px",
@@ -29,46 +32,25 @@ const labelStyle = {
 
 const cardStyle = {
   marginTop: 16,
-  padding: 14,
+  padding: 12,
   border: "1px solid #ddd",
-  borderRadius: 10,
+  borderRadius: 8,
 };
 
-const pillStyle = {
-  display: "inline-block",
-  padding: "6px 10px",
-  borderRadius: 999,
-  border: "1px solid #bbb",
-  fontSize: 12,
-  marginRight: 10,
-  marginBottom: 10,
-  background: "#fafafa",
+const sectionTitle = {
+  margin: "14px 0 8px",
+  fontSize: 14,
 };
-
-function money(n) {
-  const num = Number(n);
-  if (!Number.isFinite(num)) return String(n ?? "");
-  return num.toLocaleString(undefined, {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 0,
-  });
-}
 
 export default function Agents() {
   const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
-
   const [catalog, setCatalog] = useState(null);
   const [agentId, setAgentId] = useState("agent-weather");
   const [location, setLocation] = useState("");
-
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
 
-  // Optional: keep debug but do NOT show raw JSON unless enabled
-  const [showDebug, setShowDebug] = useState(false);
-
+  // Load agent catalog
   useEffect(() => {
     let mounted = true;
 
@@ -101,46 +83,48 @@ export default function Agents() {
     };
   }, []);
 
+  // Current selected agent object
   const agent = useMemo(() => {
     return catalog?.agents?.find((a) => a.id === agentId);
   }, [catalog, agentId]);
 
-  // when agent changes: reset location + clear old output
+  // When agent changes, reset location to that agent's first allowed location
   useEffect(() => {
-    if (!agent) return;
-    const firstLoc = agent?.allowed_locations?.[0] || "";
+    const a = catalog?.agents?.find((x) => x.id === agentId);
+    const firstLoc = a?.allowed_locations?.[0] || "";
     setLocation(firstLoc);
     setResult(null);
     setErr("");
-  }, [agentId]); // intentionally only on agent switch
+  }, [agentId, catalog]);
 
   async function runAgent() {
     setErr("");
     setResult(null);
-    setRunning(true);
-
     try {
       const data = await apiPost("/api/agent/run", {
         agent_id: agentId,
         location,
       });
 
+      // Normalized: backend returns { result: {...} }
       setResult(data?.result ?? data);
     } catch (e) {
       setErr(String(e?.message || e));
-    } finally {
-      setRunning(false);
     }
   }
 
-  const isTravel = agentId === "agent-travel";
+  // Normalize shape (in case backend changes)
+  const normalized = result?.result ? result.result : result;
 
-  // Weather shape
-  const current = result?.weather?.current;
-  const units = result?.weather?.current_units;
+  const isTravel =
+    agentId === "agent-travel" || Boolean(normalized?.travel_plan);
+  const isWeather =
+    agentId === "agent-weather" || Boolean(normalized?.weather);
 
-  // Travel shape
-  const travelPlan = result?.travel_plan;
+  const current = normalized?.weather?.current;
+  const units = normalized?.weather?.current_units;
+
+  const travelPlan = normalized?.travel_plan;
   const cost = travelPlan?.estimated_cost_usd;
 
   return (
@@ -150,148 +134,165 @@ export default function Agents() {
         Pre-defined agents & locations (cost-controlled). Powered by Lambda.
       </p>
 
+      {/* ERROR */}
       {err && <p style={{ color: "crimson" }}>Error: {err}</p>}
 
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end" }}>
-        <div>
-          <label style={labelStyle}>Agent</label>
-          <select value={agentId} onChange={(e) => setAgentId(e.target.value)} style={selectStyle}>
-            {(catalog?.agents || []).map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.label}
-              </option>
-            ))}
-          </select>
-        </div>
+      {/* DEBUG LINE */}
+      <p style={{ fontSize: 12, opacity: 0.6 }}>
+        Debug → loading: {String(loading)} | agents:{" "}
+        {catalog?.agents?.length ?? 0} | agentId: {agentId || "(empty)"} |
+        location: {location || "(empty)"}
+      </p>
 
-        <div>
-          <label style={labelStyle}>{isTravel ? "City" : "Location"}</label>
-          <select value={location} onChange={(e) => setLocation(e.target.value)} style={selectStyle}>
-            {(agent?.allowed_locations || []).map((loc) => (
-              <option key={loc} value={loc}>
-                {loc}
-              </option>
-            ))}
-          </select>
-        </div>
+      {loading ? (
+        <p>Loading agents…</p>
+      ) : (
+        <>
+          <div
+            style={{
+              display: "flex",
+              gap: 12,
+              flexWrap: "wrap",
+              alignItems: "end",
+            }}
+          >
+            <div>
+              <label style={labelStyle}>Agent</label>
+              <select
+                value={agentId}
+                onChange={(e) => setAgentId(e.target.value)}
+                style={selectStyle}
+              >
+                {(catalog?.agents || []).map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.label}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-        <button onClick={runAgent} disabled={!location || !agentId || running} style={buttonStyle}>
-          {running ? "Running…" : isTravel ? "Generate Travel Plan" : "Run Weather"}
-        </button>
+            <div>
+              <label style={labelStyle}>Location</label>
+              <select
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                style={selectStyle}
+              >
+                {(agent?.allowed_locations || []).map((loc) => (
+                  <option key={loc} value={loc}>
+                    {loc}
+                  </option>
+                ))}
+              </select>
+            </div>
 
-        <button
-          onClick={() => setShowDebug((v) => !v)}
-          style={{ ...buttonStyle, background: "#333" }}
-        >
-          {showDebug ? "Hide Debug" : "Show Debug"}
-        </button>
-      </div>
+            <button onClick={runAgent} disabled={!location || !agentId} style={buttonStyle}>
+              {agentId === "agent-travel" ? "Generate Travel Plan" : "Run Weather"}
+            </button>
+          </div>
 
-      {loading && <p style={{ marginTop: 12 }}>Loading agents…</p>}
+          {result && (
+            <div style={cardStyle}>
+              <h3 style={{ marginTop: 0 }}>
+                {normalized?.title || "Agent Result"}
+              </h3>
 
-      {result && (
-        <div style={cardStyle}>
-          <h3 style={{ marginTop: 0 }}>{result.title}</h3>
-
-          {/* WEATHER VIEW */}
-          {!isTravel && (
-            <>
-              {current ? (
-                <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
-                  <div>
-                    <b>Temp:</b> {current.temperature_2m}
-                    {units?.temperature_2m}
-                  </div>
-                  <div>
-                    <b>Feels like:</b> {current.apparent_temperature}
-                    {units?.apparent_temperature}
-                  </div>
-                  <div>
-                    <b>Humidity:</b> {current.relative_humidity_2m}
-                    {units?.relative_humidity_2m}
-                  </div>
-                  <div>
-                    <b>Wind:</b> {current.wind_speed_10m}
-                    {units?.wind_speed_10m}
-                  </div>
-                </div>
-              ) : (
-                <p>No current weather in response.</p>
-              )}
-            </>
-          )}
-
-          {/* TRAVEL VIEW */}
-          {isTravel && (
-            <>
-              {travelPlan?.error ? (
-                <p style={{ color: "crimson" }}>
-                  Travel agent error: {String(travelPlan.error)}
-                </p>
-              ) : (
+              {/* TRAVEL VIEW */}
+              {isTravel ? (
                 <>
-                  <div style={{ marginTop: 8 }}>
-                    <span style={pillStyle}>
-                      <b>Next 2 days:</b> {travelPlan?.weather_outlook?.next_2_days}
-                    </span>
-                    <span style={pillStyle}>
-                      <b>Next 5 days:</b> {travelPlan?.weather_outlook?.next_5_days}
-                    </span>
-                  </div>
+                  {travelPlan?.error ? (
+                    <p style={{ color: "crimson" }}>
+                      Travel error: {String(travelPlan.error)}
+                    </p>
+                  ) : (
+                    <>
+                      <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                        <div>
+                          <b>Next 2 days:</b>{" "}
+                          {travelPlan?.weather_outlook?.next_2_days || "-"}
+                        </div>
+                        <div>
+                          <b>Next 5 days:</b>{" "}
+                          {travelPlan?.weather_outlook?.next_5_days || "-"}
+                        </div>
+                      </div>
 
-                  <div style={{ marginTop: 10 }}>
-                    <b>2-day itinerary</b>
-                    <ul>
-                      {(travelPlan?.itinerary_2_days || []).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
+                      <h4 style={sectionTitle}>2-day itinerary</h4>
+                      <ul style={{ marginTop: 6 }}>
+                        {(travelPlan?.itinerary_2_days || []).map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
 
-                  <div style={{ marginTop: 10 }}>
-                    <b>5-day itinerary</b>
-                    <ul>
-                      {(travelPlan?.itinerary_5_days || []).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
+                      <h4 style={sectionTitle}>5-day itinerary</h4>
+                      <ul style={{ marginTop: 6 }}>
+                        {(travelPlan?.itinerary_5_days || []).map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
 
-                  <div style={{ marginTop: 10 }}>
-                    <b>Estimated cost (USD)</b>
-                    <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginTop: 6 }}>
-                      <div><b>Flights (2):</b> {money(cost?.flights_for_2)}</div>
-                      <div><b>Hotel (4★ / 5 nights):</b> {money(cost?.hotel_4_star_5_nights)}</div>
-                      <div><b>Local + food:</b> {money(cost?.local_transport_food)}</div>
-                      <div><b>Total:</b> {money(cost?.total)}</div>
+                      <h4 style={sectionTitle}>Estimated cost (USD)</h4>
+                      <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                        <div>
+                          <b>Flights (2):</b> {cost?.flights_for_2 ?? "-"}
+                        </div>
+                        <div>
+                          <b>Hotel (4★, 5 nights):</b> {cost?.hotel_4_star_5_nights ?? "-"}
+                        </div>
+                        <div>
+                          <b>Local + food:</b> {cost?.local_transport_food ?? "-"}
+                        </div>
+                        <div>
+                          <b>Total:</b> {cost?.total ?? "-"}
+                        </div>
+                      </div>
+
+                      <h4 style={sectionTitle}>Travel tips</h4>
+                      <ul style={{ marginTop: 6 }}>
+                        {(travelPlan?.travel_tips || []).map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </>
+              ) : null}
+
+              {/* WEATHER VIEW */}
+              {isWeather && !isTravel ? (
+                current ? (
+                  <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+                    <div>
+                      <b>Temp:</b> {current.temperature_2m}
+                      {units?.temperature_2m}
+                    </div>
+                    <div>
+                      <b>Feels like:</b> {current.apparent_temperature}
+                      {units?.apparent_temperature}
+                    </div>
+                    <div>
+                      <b>Humidity:</b> {current.relative_humidity_2m}
+                      {units?.relative_humidity_2m}
+                    </div>
+                    <div>
+                      <b>Wind:</b> {current.wind_speed_10m}
+                      {units?.wind_speed_10m}
                     </div>
                   </div>
+                ) : (
+                  <p>No current weather in response.</p>
+                )
+              ) : null}
 
-                  <div style={{ marginTop: 10 }}>
-                    <b>Tips</b>
-                    <ul>
-                      {(travelPlan?.travel_tips || []).map((x, i) => (
-                        <li key={i}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </>
-              )}
-            </>
-          )}
-
-          {/* DEBUG ONLY (raw JSON hidden unless debug is on) */}
-          {showDebug && (
-            <div style={{ marginTop: 12 }}>
-              <div style={{ fontSize: 12, opacity: 0.7 }}>
-                Debug: agentId={agentId}, location={location}
-              </div>
-              <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, marginTop: 8 }}>
-                {JSON.stringify(result, null, 2)}
-              </pre>
+              <details style={{ marginTop: 12 }}>
+                <summary>View raw JSON</summary>
+                <pre style={{ whiteSpace: "pre-wrap" }}>
+                  {JSON.stringify(result, null, 2)}
+                </pre>
+              </details>
             </div>
           )}
-        </div>
+        </>
       )}
     </div>
   );
