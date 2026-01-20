@@ -6,6 +6,7 @@ import { apiGet, apiPost } from "../api/client";
  * - Better readability (light background card layout)
  * - Weather shown as clean stats + optional raw JSON toggle
  * - Travel shown as formatted sections + colored itineraries
+ * - Adds a running spinner + progress status so UI never feels “hung”
  */
 
 const pageStyle = {
@@ -149,6 +150,29 @@ const liStyle = {
   lineHeight: 1.35,
 };
 
+// --- NEW: progress indicator styles ---
+const runStatusStyle = {
+  marginTop: 12,
+  color: "#374151",
+  fontWeight: 700,
+};
+
+const spinner = {
+  width: 16,
+  height: 16,
+  borderRadius: "50%",
+  border: "2px solid rgba(255,255,255,0.35)",
+  borderTopColor: "#ffffff",
+  display: "inline-block",
+  animation: "spin 0.9s linear infinite",
+};
+
+const spinnerDark = {
+  ...spinner,
+  border: "2px solid rgba(255,255,255,0.22)",
+  borderTopColor: "#ffffff",
+};
+
 function safeNumber(v) {
   if (v === null || v === undefined) return null;
   const n = Number(v);
@@ -164,7 +188,11 @@ export default function Agents() {
   const [err, setErr] = useState("");
   const [showRaw, setShowRaw] = useState(false);
 
-  // ✅ Compute selected agent FIRST (avoid "agent is not defined" crash)
+  // --- NEW: running/progress state ---
+  const [running, setRunning] = useState(false);
+  const [runningLabel, setRunningLabel] = useState("");
+
+  // Agent lookup
   const agent = useMemo(() => {
     return catalog?.agents?.find((a) => a.id === agentId);
   }, [catalog, agentId]);
@@ -183,7 +211,6 @@ export default function Agents() {
 
         setCatalog(data);
 
-        // pick first agent + first allowed location safely
         const first = data?.agents?.[0];
         const initialAgentId = first?.id || "agent-weather";
         const initialLocation = first?.allowed_locations?.[0] || "";
@@ -203,33 +230,26 @@ export default function Agents() {
     };
   }, []);
 
-  // 2) When agent changes:
-  //    - clear previous result/error
-  //    - auto-select the first allowed location if current isn't valid
+  // 2) Auto-select valid location when agent changes
   useEffect(() => {
     if (!agent) return;
 
-    setErr("");
-    setResult(null);
-    setShowRaw(false);
-
-    const allowed = agent?.allowed_locations ?? [];
-    if (!allowed.length) {
-      setLocation("");
-      return;
-    }
-
-    // If current location isn't allowed for this agent, set the first allowed
-    if (!allowed.includes(location)) {
-      setLocation(allowed[0]);
+    const firstLocation = agent.allowed_locations?.[0] || "";
+    if (firstLocation && firstLocation !== location) {
+      setLocation(firstLocation);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId, agent]); // intentionally not depending on `location` to avoid loops
+  }, [agentId, agent]);
 
   async function runAgent() {
     setErr("");
     setResult(null);
     setShowRaw(false);
+
+    const label =
+      agentId === "agent-travel" ? "Generating travel plan…" : "Fetching weather…";
+    setRunningLabel(label);
+    setRunning(true);
 
     try {
       const data = await apiPost("/api/agent/run", {
@@ -239,6 +259,9 @@ export default function Agents() {
       setResult(data?.result || data);
     } catch (e) {
       setErr(String(e?.message || e));
+    } finally {
+      setRunning(false);
+      setRunningLabel("");
     }
   }
 
@@ -248,8 +271,10 @@ export default function Agents() {
 
   // --- Travel view helpers ---
   const travelPlan = result?.travel_plan;
-  const isTravel = !!travelPlan && (result?.title || "").toLowerCase().includes("travel");
-  const isWeather = !!current && (result?.title || "").toLowerCase().includes("weather");
+  const isTravel =
+    !!travelPlan && (String(result?.title || "")).toLowerCase().includes("travel");
+  const isWeather =
+    !!current && (String(result?.title || "")).toLowerCase().includes("weather");
 
   const tripCost = travelPlan?.estimated_cost_usd || {};
   const flights = safeNumber(tripCost?.flights_for_2);
@@ -259,6 +284,11 @@ export default function Agents() {
 
   return (
     <div style={pageStyle}>
+      {/* NEW: keyframes for spinner */}
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
+
       <h2 style={headerStyle}>Agentic AI</h2>
       <p style={subStyle}>
         Select an agent and run it. Output is displayed inline (no popups). Weather uses Open-Meteo;
@@ -271,7 +301,12 @@ export default function Agents() {
         <div style={rowStyle}>
           <div>
             <label style={labelStyle}>Agent</label>
-            <select value={agentId} onChange={(e) => setAgentId(e.target.value)} style={selectStyle}>
+            <select
+              value={agentId}
+              onChange={(e) => setAgentId(e.target.value)}
+              style={selectStyle}
+              disabled={running || loading}
+            >
               {(catalog?.agents || []).map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.label}
@@ -282,7 +317,12 @@ export default function Agents() {
 
           <div>
             <label style={labelStyle}>{agentId === "agent-travel" ? "City" : "Location"}</label>
-            <select value={location} onChange={(e) => setLocation(e.target.value)} style={selectStyle}>
+            <select
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              style={selectStyle}
+              disabled={running || loading}
+            >
               {(agent?.allowed_locations ?? []).map((loc) => (
                 <option key={loc} value={loc}>
                   {loc}
@@ -293,25 +333,44 @@ export default function Agents() {
 
           <button
             onClick={runAgent}
-            disabled={!location || !agentId}
-            style={!location || !agentId ? disabledButtonStyle : buttonStyle}
+            disabled={running || !location || !agentId}
+            style={running || !location || !agentId ? disabledButtonStyle : buttonStyle}
           >
-            Run
+            {running ? (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+                <span style={spinner} />
+                Running…
+              </span>
+            ) : (
+              "Run"
+            )}
           </button>
 
           <button
             onClick={() => setShowRaw((s) => !s)}
-            disabled={!result}
+            disabled={running || !result}
             style={
-              !result
+              running || !result
                 ? disabledButtonStyle
                 : { ...buttonStyle, background: "#111827", borderColor: "#111827" }
             }
             title="Show/hide raw JSON (inline)"
           >
-            {showRaw ? "Hide raw JSON" : "Show raw JSON"}
+            {running ? (
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+                <span style={spinnerDark} />
+                Working…
+              </span>
+            ) : showRaw ? (
+              "Hide raw JSON"
+            ) : (
+              "Show raw JSON"
+            )}
           </button>
         </div>
+
+        {/* NEW: inline status line */}
+        {running && <div style={runStatusStyle}>{runningLabel || "Working…"}</div>}
 
         {loading && <p style={{ marginTop: 14, color: "#374151" }}>Loading agents…</p>}
 
@@ -370,6 +429,7 @@ export default function Agents() {
             {/* -------- Pretty Travel -------- */}
             {isTravel && (
               <div style={{ marginTop: 12 }}>
+                {/* Weather outlook */}
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <span style={badgeStyle("#eef2ff", "#3730a3")}>
                     Next 2 days: {travelPlan?.weather_outlook?.next_2_days || "—"}
@@ -379,6 +439,7 @@ export default function Agents() {
                   </span>
                 </div>
 
+                {/* Itineraries in different colors */}
                 <div
                   style={{
                     marginTop: 12,
@@ -410,6 +471,7 @@ export default function Agents() {
                   </div>
                 </div>
 
+                {/* Costs */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ ...sectionTitle, marginBottom: 8 }}>Estimated Cost (USD)</div>
                   <div style={grid2}>
@@ -432,6 +494,7 @@ export default function Agents() {
                   </div>
                 </div>
 
+                {/* Tips */}
                 <div style={{ marginTop: 12, ...listCard("#fff7ed") }}>
                   <div style={{ ...sectionTitle, color: "#9a3412" }}>Travel Tips</div>
                   <ul style={{ margin: 0, paddingLeft: 18 }}>
@@ -443,6 +506,7 @@ export default function Agents() {
                   </ul>
                 </div>
 
+                {/* If travel_plan returned an error */}
                 {travelPlan?.error && (
                   <div style={{ ...errorStyle, marginTop: 12 }}>
                     Travel agent error: {String(travelPlan.error)}
@@ -451,6 +515,7 @@ export default function Agents() {
               </div>
             )}
 
+            {/* Raw JSON toggle (inline) */}
             {showRaw && (
               <div style={{ marginTop: 12 }}>
                 <div style={{ ...sectionTitle, marginBottom: 8 }}>Raw JSON</div>
