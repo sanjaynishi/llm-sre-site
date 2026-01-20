@@ -2,15 +2,20 @@
 LLM SRE Agent API (Lambda)
 
 Endpoints (behind CloudFront /api/*):
-  GET  /api/agents        -> returns agent catalog (currently hard-coded)
-  POST /api/agent/run     -> runs a selected agent (currently: agent-weather)
+  GET  /api/agents        -> returns agent catalog (weather + travel)
+  POST /api/agent/run     -> runs a selected agent (weather or travel)
   OPTIONS *               -> CORS preflight
 
-Notes:
-- Uses Open-Meteo Geocoding API to resolve lat/lon from a location label.
-- Uses Open-Meteo Forecast API to return complete weather JSON.
-- Stdlib only (no dependencies).
-- Python 3.11 compatible.
+Weather:
+- Uses Open-Meteo Geocoding + Forecast APIs.
+- Returns current + hourly + daily (full JSON).
+
+Travel:
+- Uses OpenAI Responses API to generate compact travel JSON.
+- Cost-controlled allow-list of cities.
+- Uses env vars: OPENAI_API_KEY (required for travel), OPENAI_MODEL (optional).
+
+Python 3.11 compatible.
 """
 
 from __future__ import annotations
@@ -21,14 +26,18 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict
+from typing import Any
+
+from openai import OpenAI
 
 
 # --- Config / Guardrails ------------------------------------------------------
 
 # Allowed origins for CORS (tighten as you want).
-# If empty -> fall back to "*"
 ALLOWED_ORIGINS = {
+    "https://dev.aimlsre.com",
+    "https://aimlsre.com",
+    "https://www.aimlsre.com",
     "https://dev.snrcs.com",
     "https://dev.sanjaynishi.com",
     "https://snrcs.com",
@@ -47,21 +56,28 @@ ALLOWED_LOCATIONS = {
     "Tokyo, Japan",
 }
 
+# Travel allow-list (keep small for cost control)
+ALLOWED_CITIES = {
+    "Paris",
+    "London",
+    "New York",
+    "Tokyo",
+    "Rome",
+}
+
 AGENT_ID_WEATHER = "agent-weather"
+AGENT_ID_TRAVEL = "agent-travel"
 
 
 # --- Helpers ------------------------------------------------------------------
 
 def _pick_cors_origin(event: dict) -> str:
     """Return a safe Access-Control-Allow-Origin value."""
-    # Prefer request "Origin" header if present.
     headers = event.get("headers") or {}
-    origin = headers.get("origin") or headers.get("Origin")  # some gateways normalize
+    origin = headers.get("origin") or headers.get("Origin")
     if origin and origin in ALLOWED_ORIGINS:
         return origin
-    # Same-domain behind CloudFront often works without strict CORS;
-    # keep "*" for simplicity until auth/cookies are introduced.
-    return "*" if not origin else origin if origin in ALLOWED_ORIGINS else "*"
+    return "*"  # safe default for your current use-case
 
 
 def _json_response(event: dict, status_code: int, body: dict, extra_headers: dict | None = None) -> dict:
@@ -110,7 +126,6 @@ def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
             return json.loads(raw)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
-        # Trim long bodies for safe logs/responses
         detail = (detail[:500] + "...") if len(detail) > 500 else detail
         raise RuntimeError(f"HTTP {e.code} calling upstream: {url} :: {detail}") from e
     except urllib.error.URLError as e:
@@ -120,9 +135,6 @@ def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
 # --- Open-Meteo Calls ---------------------------------------------------------
 
 def geocode_location(location: str) -> dict:
-    """
-    Resolve latitude/longitude from a human location label using Open-Meteo Geocoding.
-    """
     base = "https://geocoding-api.open-meteo.com/v1/search"
     safe_location = location.strip()
 
@@ -131,10 +143,8 @@ def geocode_location(location: str) -> dict:
         data = _http_get_json(f"{base}?{qs}")
         return data.get("results") or []
 
-    # Try full label first
     results = _query(safe_location)
 
-    # If empty and label has comma, retry with left side (e.g., "London" from "London, UK")
     if not results and "," in safe_location:
         fallback = safe_location.split(",", 1)[0].strip()
         results = _query(fallback)
@@ -154,9 +164,6 @@ def geocode_location(location: str) -> dict:
 
 
 def fetch_weather(lat: float, lon: float) -> dict:
-    """
-    Fetch complete weather info (current + hourly + daily) from Open-Meteo Forecast API.
-    """
     base = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -210,6 +217,105 @@ def fetch_weather(lat: float, lon: float) -> dict:
     return _http_get_json(url)
 
 
+# --- OpenAI Travel ------------------------------------------------------------
+
+def _openai_client() -> OpenAI:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    return OpenAI(api_key=key)
+
+
+def _extract_output_text(resp: Any) -> str:
+    # Works across newer SDK variants
+    txt = getattr(resp, "output_text", None)
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+
+    acc = ""
+    for item in getattr(resp, "output", []) or []:
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    acc += content.get("text", "")
+    return (acc or "").strip()
+
+
+def generate_travel_plan(city: str) -> dict:
+    client = _openai_client()
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.1-mini")
+
+    prompt = f"""
+You are a travel planning assistant.
+
+City: {city}
+
+Return VALID JSON ONLY with this exact structure:
+
+{{
+  "weather_outlook": {{
+    "next_2_days": "sunny | partly cloudy | cloudy | rainy",
+    "next_5_days": "sunny | partly cloudy | cloudy | rainy"
+  }},
+  "itinerary_2_days": [
+    "Day 1: ...",
+    "Day 2: ..."
+  ],
+  "itinerary_5_days": [
+    "Day 1: ...",
+    "Day 2: ...",
+    "Day 3: ...",
+    "Day 4: ...",
+    "Day 5: ..."
+  ],
+  "estimated_cost_usd": {{
+    "flights_for_2": number,
+    "hotel_4_star_5_nights": number,
+    "local_transport_food": number,
+    "total": number
+  }},
+  "travel_tips": [
+    "...",
+    "...",
+    "..."
+  ]
+}}
+
+Rules:
+- Keep responses concise and realistic
+- Assume travel from a major US city
+- Costs approximate, not exact
+- total must equal the sum of all cost fields
+- No markdown, no explanations, JSON only
+"""
+
+    resp = client.responses.create(
+        model=model,
+        input=prompt,
+        max_output_tokens=650,
+    )
+
+    raw = _extract_output_text(resp)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "Failed to parse JSON from model", "raw_output": raw[:1200]}
+
+    # enforce total correctness
+    try:
+        c = data.get("estimated_cost_usd", {})
+        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(
+            c.get("local_transport_food", 0)
+        )
+        c["total"] = round(parts, 0)
+        data["estimated_cost_usd"] = c
+    except Exception:
+        pass
+
+    return data
+
+
 # --- API Routes ---------------------------------------------------------------
 
 def _handle_get_agents(event: dict) -> dict:
@@ -221,7 +327,14 @@ def _handle_get_agents(event: dict) -> dict:
                 "label": "Weather information (full details)",
                 "mode": "tool_weather",
                 "allowed_locations": sorted(ALLOWED_LOCATIONS),
-            }
+            },
+            {
+                "id": AGENT_ID_TRAVEL,
+                "category": "Travel",
+                "label": "Travel planner (AI-powered)",
+                "mode": "tool_travel",
+                "allowed_locations": sorted(ALLOWED_CITIES),
+            },
         ]
     }
     return _json_response(event, 200, agents)
@@ -232,44 +345,65 @@ def _handle_post_agent_run(event: dict) -> dict:
     agent_id = req.get("agent_id")
     location = req.get("location")
 
-    if agent_id != AGENT_ID_WEATHER:
-        return _json_response(
-            event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}}
-        )
+    if not agent_id:
+        return _json_response(event, 400, {"error": {"code": "MISSING_AGENT", "message": "agent_id is required"}})
 
     if not location:
-        return _json_response(
-            event, 400, {"error": {"code": "MISSING_LOCATION", "message": "location is required"}}
-        )
+        return _json_response(event, 400, {"error": {"code": "MISSING_LOCATION", "message": "location is required"}})
 
-    if location not in ALLOWED_LOCATIONS:
+    # --- WEATHER ---
+    if agent_id == AGENT_ID_WEATHER:
+        if location not in ALLOWED_LOCATIONS:
+            return _json_response(
+                event,
+                400,
+                {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}},
+            )
+
+        geo = geocode_location(location)
+        if geo.get("lat") is None or geo.get("lon") is None:
+            return _json_response(
+                event,
+                500,
+                {"error": {"code": "GEOCODE_FAILED", "message": "Geocoding did not return coordinates"}},
+            )
+
+        weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
+
         return _json_response(
             event,
-            400,
-            {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}},
+            200,
+            {
+                "result": {
+                    "title": f"Weather: {location}",
+                    "geocoding": geo,
+                    "weather": weather,
+                }
+            },
         )
 
-    geo = geocode_location(location)
-    if geo.get("lat") is None or geo.get("lon") is None:
+    # --- TRAVEL ---
+    if agent_id == AGENT_ID_TRAVEL:
+        city = location.strip()
+        if city not in ALLOWED_CITIES:
+            return _json_response(
+                event,
+                400,
+                {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}},
+            )
+
+        try:
+            travel = generate_travel_plan(city)
+        except Exception as e:
+            return _json_response(event, 500, {"error": {"code": "TRAVEL_FAILED", "message": str(e)}})
+
         return _json_response(
             event,
-            500,
-            {"error": {"code": "GEOCODE_FAILED", "message": "Geocoding did not return coordinates"}},
+            200,
+            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
         )
 
-    weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-
-    return _json_response(
-        event,
-        200,
-        {
-            "result": {
-                "title": f"Weather: {location}",
-                "geocoding": geo,
-                "weather": weather,
-            }
-        },
-    )
+    return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
 
 # --- Lambda entrypoint --------------------------------------------------------
@@ -281,7 +415,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
     if method == "OPTIONS":
         return _json_response(event, 200, {"ok": True})
 
-    # We route by suffix so it works whether the request is /agents or /api/agents.
+    # route by suffix so it works behind /api/* on CloudFront
     if method == "GET" and path.endswith("/agents"):
         return _handle_get_agents(event)
 
