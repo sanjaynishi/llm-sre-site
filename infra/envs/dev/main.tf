@@ -29,9 +29,12 @@ module "site" {
 
 module "agent_api" {
   source = "../../modules/agent_api"
-
+  
+  openai_api_key = var.openai_api_key
+  openai_model   = "gpt-4o-mini"
   env        = var.env
   aws_region = var.aws_region
+  
 
   # IMPORTANT: path from infra/envs/dev -> repo_root/services/agent_api
   lambda_src_dir = "${path.module}/../../../services/agent_api"

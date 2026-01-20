@@ -57,6 +57,8 @@ resource "aws_lambda_function" "agent_api" {
     variables = {
       ENV = var.env
       # later: GEO_CACHE_TABLE, USAGE_TABLE, GPT limits, etc.
+      OPENAI_API_KEY = var.openai_api_key   # injected from CI/CD
+      OPENAI_MODEL   = var.openai_model
     }
   }
 }
