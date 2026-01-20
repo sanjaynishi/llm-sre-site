@@ -19,6 +19,9 @@ jobs:
   deploy-dev:
     runs-on: ubuntu-latest
     environment: dev
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout
@@ -58,18 +61,46 @@ jobs:
 
       - name: Terraform Apply (DEV)
         working-directory: infra/envs/dev
-        run: terraform apply -auto-approve -input=false
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m
 
       # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Read Terraform outputs (DEV)
         id: tfout
         working-directory: infra/envs/dev
         run: |
-          echo "S3_BUCKET=$(terraform output -raw s3_bucket_dev)" >> $GITHUB_OUTPUT
-          echo "CF_DIST_ID=$(terraform output -raw cloudfront_dist_id_dev)" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          DOMAIN="dev.aimlsre.com"
+          TFOUT_JSON="$(terraform output -json)"
+
+          S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN" '.s3_buckets.value[$d]')"
+          if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
+            echo "::error::Could not read S3 bucket from terraform output for $DOMAIN"
+            echo "$TFOUT_JSON" | jq .
+            exit 1
+          fi
+
+          CF_DIST_ID="$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?contains(Aliases.Items, \`$DOMAIN\`)].Id | [0]" \
+            --output text)"
+          if [ -z "$CF_DIST_ID" ] || [ "$CF_DIST_ID" = "None" ]; then
+            echo "::error::Could not find CloudFront distribution id for alias $DOMAIN"
+            exit 1
+          fi
+
+          echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "CF_DIST_ID=$CF_DIST_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved: S3_BUCKET=$S3_BUCKET  CF_DIST_ID=$CF_DIST_ID"
 
       - name: Sync UI to S3
-        run: aws s3 sync ui/dist s3://${{ steps.tfout.outputs.S3_BUCKET }}/ --delete
+        run: |
+          aws s3 sync ui/dist "s3://${{ steps.tfout.outputs.S3_BUCKET }}/" --delete
 
       - name: Invalidate CloudFront
-        run: aws cloudfront create-invalidation --distribution-id ${{ steps.tfout.outputs.CF_DIST_ID }} --paths "/*"
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.tfout.outputs.CF_DIST_ID }}" \
+            --paths "/*"
