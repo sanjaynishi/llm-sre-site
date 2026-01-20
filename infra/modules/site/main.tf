@@ -53,7 +53,10 @@ resource "aws_s3_bucket" "site" {
   )
 
   tags = {
-    Domain = each.key
+    Project = "llm-sre"
+    Env     = var.env
+    Domain  = each.key
+    Owner   = "sanjay"
   }
 }
 

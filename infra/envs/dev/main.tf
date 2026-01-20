@@ -22,8 +22,7 @@ module "site" {
   api_domain_name = replace(replace(module.agent_api.http_api_endpoint, "https://", ""), "/", "")
 
   domains = {
-    "dev.sanjaynishi.com" = "dev.sanjaynishi.com"
-    "dev.snrcs.com"       = "dev.snrcs.com"
+    "dev.aimlsre.com" = "dev.aimlsre.com"
   }
 
 }

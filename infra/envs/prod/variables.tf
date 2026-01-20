@@ -6,3 +6,9 @@ variable "aws_region" {
 variable "acm_certificate_arn" {
   type = string
 }
+
+variable "api_domain_name" {
+  type    = string
+  default = ""
+}
+
