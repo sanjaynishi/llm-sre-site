@@ -2,7 +2,7 @@
 LLM SRE Agent API (Lambda)
 
 Endpoints (behind CloudFront /api/*):
-  GET  /api/agents        -> returns agent catalog (S3-backed + fallback)
+  GET  /api/agents        -> returns agent catalog (from S3 if configured; fallback otherwise)
   POST /api/agent/run     -> runs a selected agent:
        - agent-weather (Open-Meteo)
        - agent-travel  (OpenAI over HTTPS, no SDK required)
@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,7 +41,7 @@ ALLOWED_ORIGINS = {
     "https://www.sanjaynishi.com",
 }
 
-# Fallback allowlists if S3 config missing/unreadable
+# Hard-coded fallbacks (used if S3 config missing/unreadable)
 DEFAULT_ALLOWED_LOCATIONS = {
     "New York, NY",
     "San Francisco, CA",
@@ -51,104 +50,71 @@ DEFAULT_ALLOWED_LOCATIONS = {
     "Delhi, India",
     "Tokyo, Japan",
 }
-
 DEFAULT_TRAVEL_CITIES = {"Paris", "London", "New York", "Tokyo", "Rome"}
 
 AGENT_ID_WEATHER = "agent-weather"
 AGENT_ID_TRAVEL = "agent-travel"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.1-mini").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2").strip()
+
+# Optional: comma-separated fallback models (try in order if model_not_found)
+# Example: "gpt-5.2,gpt-5"
+OPENAI_FALLBACK_MODELS = [
+    m.strip() for m in os.environ.get("OPENAI_FALLBACK_MODELS", "").split(",") if m.strip()
+]
 
 AGENT_CONFIG_BUCKET = os.environ.get("AGENT_CONFIG_BUCKET", "").strip()
 AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").strip()
 
 
-# --- S3 Config Cache (ETag-aware) --------------------------------------------
+# --- S3 helpers (config) ------------------------------------------------------
 
 _s3 = None
-_config_cache = {
-    "agents": None,
-    "allowlists": None,
-    "etag_agents": None,
-    "etag_allow": None,
-    "last_check_ts": 0.0,
-}
-
-# How often we check ETags (seconds). Small + safe.
-CONFIG_ETAG_CHECK_INTERVAL_SEC = 10
+_config_cache = {"agents": None, "allowlists": None}
 
 
 def _s3_client():
     global _s3
     if boto3 is None:
-        raise RuntimeError("boto3 not available (local lint). Lambda runtime includes boto3.")
+        raise RuntimeError("boto3 not available")
     if _s3 is None:
         _s3 = boto3.client("s3")
     return _s3
 
 
-def _s3_head_etag(bucket: str, key: str) -> str | None:
-    try:
-        resp = _s3_client().head_object(Bucket=bucket, Key=key)
-        etag = resp.get("ETag")
-        return etag.strip('"') if isinstance(etag, str) else None
-    except Exception:
-        return None
-
-
 def _s3_get_json(bucket: str, key: str) -> dict:
-    resp = _s3_client().get_object(Bucket=bucket, Key=key)
-    raw = resp["Body"].read().decode("utf-8")
-    return json.loads(raw)
+    try:
+        resp = _s3_client().get_object(Bucket=bucket, Key=key)
+        raw = resp["Body"].read().decode("utf-8")
+        return json.loads(raw)
+    except ClientError as e:
+        raise RuntimeError(f"S3 get_object failed for s3://{bucket}/{key}: {e}") from e
 
 
 def _load_agent_config() -> Tuple[dict, dict]:
     """
     Returns (agents_json, allowlists_json).
-    - If env vars not set or boto3 missing: returns ({}, {})
-    - Uses ETag-aware cache so updates in S3 are picked up quickly.
+    If S3 config missing/unavailable, returns ({}, {}) and caller falls back.
+    Uses simple warm-start cache (Lambda).
     """
-    if not AGENT_CONFIG_BUCKET or boto3 is None:
+    if not AGENT_CONFIG_BUCKET:
         return {}, {}
+
+    if _config_cache["agents"] is not None and _config_cache["allowlists"] is not None:
+        return _config_cache["agents"], _config_cache["allowlists"]
 
     agents_key = f"{AGENT_CONFIG_PREFIX}/agents.json"
     allow_key = f"{AGENT_CONFIG_PREFIX}/allowlists.json"
 
-    now = time.time()
-
-    # If we have cached values, only check ETags every N seconds.
-    if (
-        _config_cache["agents"] is not None
-        and _config_cache["allowlists"] is not None
-        and (now - float(_config_cache["last_check_ts"] or 0.0)) < CONFIG_ETAG_CHECK_INTERVAL_SEC
-    ):
-        return _config_cache["agents"], _config_cache["allowlists"]
-
-    _config_cache["last_check_ts"] = now
-
-    # Read current ETags
-    etag_agents = _s3_head_etag(AGENT_CONFIG_BUCKET, agents_key)
-    etag_allow = _s3_head_etag(AGENT_CONFIG_BUCKET, allow_key)
-
-    # If nothing changed and we already have cached content, return cache.
-    if (
-        _config_cache["agents"] is not None
-        and _config_cache["allowlists"] is not None
-        and etag_agents
-        and etag_allow
-        and etag_agents == _config_cache["etag_agents"]
-        and etag_allow == _config_cache["etag_allow"]
-    ):
-        return _config_cache["agents"], _config_cache["allowlists"]
-
-    # Otherwise reload (best-effort)
     agents = {}
     allow = {}
+
     try:
         agents = _s3_get_json(AGENT_CONFIG_BUCKET, agents_key)
     except Exception:
         agents = {}
+
     try:
         allow = _s3_get_json(AGENT_CONFIG_BUCKET, allow_key)
     except Exception:
@@ -156,44 +122,44 @@ def _load_agent_config() -> Tuple[dict, dict]:
 
     _config_cache["agents"] = agents
     _config_cache["allowlists"] = allow
-    _config_cache["etag_agents"] = etag_agents
-    _config_cache["etag_allow"] = etag_allow
-
     return agents, allow
 
 
-def _normalize_str_list(v) -> list[str]:
-    if not isinstance(v, list):
+def _normalize_str_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
         return []
     out: list[str] = []
-    for x in v:
+    for x in value:
         s = str(x).strip()
         if s:
             out.append(s)
     return out
 
 
-def _effective_allowlists() -> Tuple[set[str], set[str]]:
+def _effective_allowlists() -> Tuple[list[str], list[str]]:
     """
-    Returns (allowed_weather_locations, allowed_travel_cities)
-    based on allowlists.json if present; else falls back to defaults.
+    Returns (weather_locations, travel_cities) using allowlists.json if present,
+    else fall back to hard-coded defaults.
     allowlists.json format:
       {
-        "weather_locations": ["Delhi, India", ...],
-        "travel_cities": ["Delhi", "Paris", ...]
+        "weather_locations": [...],
+        "travel_cities": [...]
       }
     """
     _, allow_cfg = _load_agent_config()
-    weather_locations = _normalize_str_list((allow_cfg or {}).get("weather_locations"))
-    travel_cities = _normalize_str_list((allow_cfg or {}).get("travel_cities"))
 
-    allow_weather = set(weather_locations) if weather_locations else set(DEFAULT_ALLOWED_LOCATIONS)
-    allow_travel = set(travel_cities) if travel_cities else set(DEFAULT_TRAVEL_CITIES)
+    weather_locations = _normalize_str_list(allow_cfg.get("weather_locations")) if isinstance(allow_cfg, dict) else []
+    travel_cities = _normalize_str_list(allow_cfg.get("travel_cities")) if isinstance(allow_cfg, dict) else []
 
-    return allow_weather, allow_travel
+    if not weather_locations:
+        weather_locations = sorted(DEFAULT_ALLOWED_LOCATIONS)
+    if not travel_cities:
+        travel_cities = sorted(DEFAULT_TRAVEL_CITIES)
+
+    return weather_locations, travel_cities
 
 
-# --- HTTP Helpers -------------------------------------------------------------
+# --- HTTP helpers -------------------------------------------------------------
 
 def _pick_cors_origin(event: dict) -> str:
     headers = event.get("headers") or {}
@@ -366,7 +332,18 @@ def fetch_weather(lat: float, lon: float) -> dict:
     return _http_get_json(url)
 
 
-# --- OpenAI Travel (HTTPS, no SDK) --------------------------------------------
+# --- OpenAI Travel (stdlib-only HTTPS) ----------------------------------------
+
+def _openai_call(model: str, prompt: str) -> dict:
+    url = "https://api.openai.com/v1/responses"
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 650,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    return _http_post_json(url, payload, headers=headers, timeout_sec=25)
+
 
 def get_travel_info(city: str) -> dict:
     if not OPENAI_API_KEY:
@@ -402,18 +379,39 @@ Rules:
 - No markdown; JSON only
 """.strip()
 
-    url = "https://api.openai.com/v1/responses"
-    payload = {"model": OPENAI_MODEL, "input": prompt, "max_output_tokens": 650}
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    # Try primary model, then fallback models if model_not_found happens.
+    models_to_try = [OPENAI_MODEL] + [m for m in OPENAI_FALLBACK_MODELS if m != OPENAI_MODEL]
 
-    try:
-        resp = _http_post_json(url, payload, headers=headers, timeout_sec=25)
-    except Exception as e:
-        return {"error": f"OpenAI call failed: {str(e)}"}
+    last_err = None
+    resp = None
 
-    if isinstance(resp, dict) and resp.get("error"):
-        return {"error": f"OpenAI API error: {resp.get('error')}"}
+    for m in models_to_try:
+        try:
+            resp = _openai_call(m, prompt)
+        except Exception as e:
+            last_err = f"OpenAI call failed (model={m}): {e}"
+            continue
 
+        # OpenAI error payloads are usually like: {"error": {...}}
+        if isinstance(resp, dict) and resp.get("error"):
+            err_obj = resp.get("error") or {}
+            code = err_obj.get("code") or ""
+            msg = err_obj.get("message") or str(err_obj)
+            last_err = f"OpenAI API error (model={m}): {code} {msg}"
+
+            # Retry only if model not found
+            if code == "model_not_found" or "does not exist" in str(msg).lower():
+                continue
+
+            return {"error": last_err}
+
+        # Success
+        break
+
+    if not isinstance(resp, dict) or resp.get("error"):
+        return {"error": last_err or "OpenAI call failed"}
+
+    # Extract output text
     output_text = ""
     for item in resp.get("output", []) or []:
         if item.get("type") == "message":
@@ -422,6 +420,8 @@ Rules:
                     output_text += c.get("text", "")
 
     output_text = (output_text or "").strip() or (resp.get("output_text") or "").strip()
+    if not output_text:
+        return {"error": "OpenAI returned empty output"}
 
     candidate = _extract_json_object(output_text)
     try:
@@ -429,11 +429,13 @@ Rules:
     except json.JSONDecodeError:
         return {"error": "Failed to parse JSON from model", "raw_output": output_text[:1200]}
 
-    # sanity-check total
+    # Sanity-check total
     try:
         c = data.get("estimated_cost_usd", {})
-        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(
-            c.get("local_transport_food", 0)
+        parts = (
+            float(c.get("flights_for_2", 0))
+            + float(c.get("hotel_4_star_5_nights", 0))
+            + float(c.get("local_transport_food", 0))
         )
         c["total"] = round(parts, 0)
         data["estimated_cost_usd"] = c
@@ -446,9 +448,7 @@ Rules:
 # --- API Routes ---------------------------------------------------------------
 
 def _handle_get_agents(event: dict) -> dict:
-    # Always derive allowlists (S3-backed if available)
-    allow_weather, allow_travel = _effective_allowlists()
-
+    # fallback catalog if S3 is missing/unreadable
     default_agents = {
         "agents": [
             {
@@ -456,45 +456,41 @@ def _handle_get_agents(event: dict) -> dict:
                 "category": "Weather",
                 "label": "Weather information (full details)",
                 "mode": "tool_weather",
-                "allowed_locations": sorted(allow_weather),
+                "allowed_locations": sorted(DEFAULT_ALLOWED_LOCATIONS),
             },
             {
                 "id": AGENT_ID_TRAVEL,
                 "category": "Travel",
                 "label": "Travel planner (AI-powered)",
                 "mode": "tool_travel",
-                "allowed_locations": sorted(allow_travel),
+                "allowed_locations": sorted(DEFAULT_TRAVEL_CITIES),
             },
         ]
     }
 
-    # Try to use agents.json for labels/categories/modes (but never trust it for allowlists)
-    agents_cfg, _ = _load_agent_config()
-    merged = {"agents": []}
+    try:
+        agents_cfg, _ = _load_agent_config()
+        weather_locations, travel_cities = _effective_allowlists()
 
-    if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
-        for a in agents_cfg["agents"]:
-            if not isinstance(a, dict) or not a.get("id"):
-                continue
-            a2 = dict(a)
-            if a2["id"] == AGENT_ID_WEATHER:
-                a2["allowed_locations"] = sorted(allow_weather)
-            elif a2["id"] == AGENT_ID_TRAVEL:
-                a2["allowed_locations"] = sorted(allow_travel)
-            merged["agents"].append(a2)
+        # agents.json structure: { "agents": [ {id,category,label,mode}, ... ] }
+        if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
+            merged = {"agents": []}
+            for a in agents_cfg["agents"]:
+                if not isinstance(a, dict) or not a.get("id"):
+                    continue
+                a2 = dict(a)
+                if a2["id"] == AGENT_ID_WEATHER:
+                    a2["allowed_locations"] = weather_locations
+                elif a2["id"] == AGENT_ID_TRAVEL:
+                    a2["allowed_locations"] = travel_cities
+                merged["agents"].append(a2)
 
-    body = merged if merged["agents"] else default_agents
+            if merged["agents"]:
+                return _json_response(event, 200, merged)
 
-    # Prevent CloudFront/browser caching of catalog
-    return _json_response(
-        event,
-        200,
-        body,
-        extra_headers={
-            "Cache-Control": "no-store, max-age=0",
-            "Pragma": "no-cache",
-        },
-    )
+        return _json_response(event, 200, default_agents)
+    except Exception:
+        return _json_response(event, 200, default_agents)
 
 
 def _handle_post_agent_run(event: dict) -> dict:
@@ -507,7 +503,9 @@ def _handle_post_agent_run(event: dict) -> dict:
     if not location:
         return _json_response(event, 400, {"error": {"code": "MISSING_LOCATION", "message": "location is required"}})
 
-    allow_weather, allow_travel = _effective_allowlists()
+    weather_locations, travel_cities = _effective_allowlists()
+    allow_weather = set(weather_locations)
+    allow_travel = set(travel_cities)
 
     if agent_id == AGENT_ID_WEATHER:
         if location not in allow_weather:
@@ -521,7 +519,7 @@ def _handle_post_agent_run(event: dict) -> dict:
         return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
 
     if agent_id == AGENT_ID_TRAVEL:
-        city = str(location).strip()
+        city = location.strip()
         if city not in allow_travel:
             return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
 
