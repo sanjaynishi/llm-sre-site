@@ -7,6 +7,7 @@ import { apiGet, apiPost } from "../api/client";
  * - Weather shown as clean stats + optional raw JSON toggle
  * - Travel shown as formatted sections + colored itineraries
  * - Shows a spinner while running
+ * - FIX: dropdowns are never blank on first load (defaults applied after catalog loads)
  */
 
 const pageStyle = {
@@ -197,14 +198,14 @@ export default function Agents() {
   const [running, setRunning] = useState(false);
 
   const [catalog, setCatalog] = useState(null);
-  const [agentId, setAgentId] = useState("agent-weather");
-  const [location, setLocation] = useState("");
+  const [agentId, setAgentId] = useState("");     // ✅ start empty; we set after catalog loads
+  const [location, setLocation] = useState("");   // ✅ start empty; we set after catalog loads
 
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
   const [showRaw, setShowRaw] = useState(false);
 
-  // derive current agent FIRST (so effects can use it safely)
+  // Derive current agent from catalog + agentId
   const agent = useMemo(() => {
     return catalog?.agents?.find((a) => a.id === agentId) || null;
   }, [catalog, agentId]);
@@ -217,19 +218,9 @@ export default function Agents() {
       try {
         setErr("");
         setLoadingCatalog(true);
-
         const data = await apiGet("/api/agents");
         if (!mounted) return;
-
         setCatalog(data);
-
-        // pick first agent + first location
-        const firstAgent = data?.agents?.[0];
-        const initialAgentId = firstAgent?.id || "agent-weather";
-        const initialLocation = firstAgent?.allowed_locations?.[0] || "";
-
-        setAgentId(initialAgentId);
-        setLocation(initialLocation);
       } catch (e) {
         if (!mounted) return;
         setErr(String(e?.message || e));
@@ -243,16 +234,29 @@ export default function Agents() {
     };
   }, []);
 
-  // 2) Auto-select valid location when agent changes
+  // 2) Apply defaults AFTER catalog loads (fixes blank dropdowns)
   useEffect(() => {
-    if (!agent) return;
+    const agents = catalog?.agents || [];
+    if (!agents.length) return;
 
-    const firstLocation = agent.allowed_locations?.[0] || "";
-    if (!location || (firstLocation && !agent.allowed_locations?.includes(location))) {
-      setLocation(firstLocation);
+    // If current agentId is empty or not present in catalog, select first agent
+    const agentExists = agents.some((a) => a.id === agentId);
+    if (!agentId || !agentExists) {
+      const first = agents[0];
+      setAgentId(first.id);
+      setLocation(first.allowed_locations?.[0] || "");
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentId, agent]); // intentionally not depending on location to avoid loops
+
+    // If agentId is valid but location is empty/invalid for this agent, fix location
+    const currentAgent = agents.find((a) => a.id === agentId);
+    const allowed = currentAgent?.allowed_locations || [];
+    const locationValid = location && allowed.includes(location);
+
+    if (!locationValid) {
+      setLocation(allowed?.[0] || "");
+    }
+  }, [catalog, agentId]); // intentionally NOT depending on `location` to avoid loops
 
   async function runAgent() {
     setErr("");
@@ -293,6 +297,8 @@ export default function Agents() {
   const local = safeNumber(tripCost?.local_transport_food);
   const total = safeNumber(tripCost?.total);
 
+  const runLabel = agentId === "agent-travel" ? "travel" : "weather";
+
   return (
     <div style={pageStyle}>
       <h2 style={headerStyle}>Agentic AI</h2>
@@ -313,6 +319,7 @@ export default function Agents() {
               style={selectStyle}
               disabled={loadingCatalog}
             >
+              {loadingCatalog && <option value="">Loading…</option>}
               {(catalog?.agents || []).map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.label}
@@ -327,8 +334,12 @@ export default function Agents() {
               value={location}
               onChange={(e) => setLocation(e.target.value)}
               style={selectStyle}
-              disabled={!agent || loadingCatalog}
+              disabled={loadingCatalog || !agent}
             >
+              {loadingCatalog && <option value="">Loading…</option>}
+              {!loadingCatalog && agent && (agent.allowed_locations || []).length === 0 && (
+                <option value="">No locations configured</option>
+              )}
               {(agent?.allowed_locations || []).map((loc) => (
                 <option key={loc} value={loc}>
                   {loc}
@@ -339,8 +350,8 @@ export default function Agents() {
 
           <button
             onClick={runAgent}
-            disabled={running || !location || !agentId}
-            style={running || !location || !agentId ? disabledButtonStyle : buttonStyle}
+            disabled={running || loadingCatalog || !location || !agentId}
+            style={running || loadingCatalog || !location || !agentId ? disabledButtonStyle : buttonStyle}
           >
             {running ? "Running…" : "Run"}
           </button>
@@ -358,7 +369,7 @@ export default function Agents() {
             {showRaw ? "Hide raw JSON" : "Show raw JSON"}
           </button>
 
-          {running && <Spinner label={`Running ${agentId === "agent-travel" ? "travel" : "weather"}…`} />}
+          {running && <Spinner label={`Running ${runLabel}…`} />}
         </div>
 
         {loadingCatalog && <p style={{ marginTop: 14, color: "#374151" }}>Loading agents…</p>}
