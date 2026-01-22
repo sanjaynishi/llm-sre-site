@@ -1,3 +1,10 @@
+# main.tf (modules/agent_api)
+# Updated with:
+# - CloudWatch Logs permissions (AWSLambdaBasicExecutionRole)
+# - S3 config read permissions (ListBucket + GetObject)
+# - Build dir creation for archive output_path
+# - API Gateway v2 CORS configuration (so browser Run button works)
+
 terraform {
   required_providers {
     aws = {
@@ -16,8 +23,16 @@ locals {
   lambda_name = "${var.name_prefix}-agent-api-${var.env}"
 }
 
-# Zip the lambda code (stdlib only)
+# Ensure build dir exists for zip output
+resource "null_resource" "build_dir" {
+  provisioner "local-exec" {
+    command = "mkdir -p ${path.module}/build"
+  }
+}
+
+# Zip the lambda code (stdlib only, plus whatever you vendor/package)
 data "archive_file" "lambda_zip" {
+  depends_on  = [null_resource.build_dir]
   type        = "zip"
   source_dir  = var.lambda_src_dir
   output_path = "${path.module}/build/${local.lambda_name}.zip"
@@ -27,15 +42,16 @@ resource "aws_iam_role" "lambda_role" {
   name = "${local.lambda_name}-role"
 
   assume_role_policy = jsonencode({
-    Version = "2012-10-17",
+    Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow",
-      Principal = { Service = "lambda.amazonaws.com" },
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
       Action = "sts:AssumeRole"
     }]
   })
 }
 
+# ✅ REQUIRED: CloudWatch Logs permissions for Lambda
 resource "aws_iam_role_policy_attachment" "lambda_basic_logs" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -56,9 +72,14 @@ resource "aws_lambda_function" "agent_api" {
   environment {
     variables = {
       ENV = var.env
-      # later: GEO_CACHE_TABLE, USAGE_TABLE, GPT limits, etc.
-      OPENAI_API_KEY = var.openai_api_key   # injected from CI/CD
+
+      # OpenAI (travel agent)
+      OPENAI_API_KEY = var.openai_api_key
       OPENAI_MODEL   = var.openai_model
+
+      # S3-backed config for dropdowns/catalog
+      AGENT_CONFIG_BUCKET = var.agent_config_bucket
+      AGENT_CONFIG_PREFIX = var.agent_config_prefix
     }
   }
 }
@@ -67,6 +88,18 @@ resource "aws_lambda_function" "agent_api" {
 resource "aws_apigatewayv2_api" "http_api" {
   name          = local.api_name
   protocol_type = "HTTP"
+
+  # ✅ IMPORTANT: makes browser preflight work (Run button)
+  cors_configuration {
+    allow_origins = [
+      "https://dev.aimlsre.com",
+      "https://aimlsre.com",
+      "https://www.aimlsre.com"
+    ]
+    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_headers = ["Content-Type"]
+    max_age       = 3600
+  }
 }
 
 resource "aws_apigatewayv2_stage" "default" {

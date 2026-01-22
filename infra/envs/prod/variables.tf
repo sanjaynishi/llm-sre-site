@@ -14,5 +14,5 @@ variable "openai_api_key" {
 variable "openai_model" {
   description = "OpenAI model for travel generation"
   type        = string
-  default     = "gpt-4o-mini"
+  default     = "gpt-5.1-mini"
 }

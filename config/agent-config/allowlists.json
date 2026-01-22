@@ -1,0 +1,11 @@
+{
+    "weather_locations": [
+      "Delhi, India",
+      "London, UK",
+      "New York, NY",
+      "San Francisco, CA",
+      "Seattle, WA",
+      "Tokyo, Japan"
+    ],
+    "travel_cities": ["Paris", "Delhi", "London", "New York", "Tokyo", "Rome"]
+  }

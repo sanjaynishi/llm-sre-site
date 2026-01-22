@@ -34,3 +34,14 @@ variable "openai_model" {
   type        = string
   default     = "gpt-5.1-mini"
 }
+
+variable "agent_config_bucket" {
+  type        = string
+  description = "S3 bucket that stores agent config JSON files (agents.json, allowlists.json)"
+}
+
+variable "agent_config_prefix" {
+  type        = string
+  description = "Prefix/folder in the bucket where config files are stored"
+  default     = "agent-config"
+}

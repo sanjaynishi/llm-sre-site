@@ -1,0 +1,32 @@
+{
+  "agents": [
+    {
+      "id": "agent-weather",
+      "category": "Weather",
+      "label": "Weather information (full details)",
+      "mode": "tool_weather",
+      "allowed_locations": [
+        "Delhi, India",
+        "London, UK",
+        "New York, NY",
+        "San Francisco, CA",
+        "Seattle, WA",
+        "Tokyo, Japan"
+      ]
+    },
+    {
+      "id": "agent-travel",
+      "category": "Travel",
+      "label": "Travel planner (AI-powered)",
+      "mode": "tool_travel",
+      "allowed_locations": [
+        "Paris",
+        "Delhi",
+        "London",
+        "New York",
+        "Tokyo",
+        "Rome"
+      ]
+    }
+  ]
+}
