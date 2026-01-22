@@ -3,10 +3,12 @@ import { apiGet, apiPost } from "../api/client";
 
 /**
  * Agents page (inline UI, no popups)
- * - Better readability (light background card layout)
+ * - Improved readability (light background card layout)
+ * - Better dropdown styling (pretty background, focus ring)
+ * - Clear "selected" tab styling (prominent active state)
  * - Weather shown as clean stats + optional raw JSON toggle
  * - Travel shown as formatted sections + colored itineraries
- * - Adds a running spinner + progress status so UI never feels “hung”
+ * - Spinner on Run
  */
 
 const pageStyle = {
@@ -21,7 +23,7 @@ const pageStyle = {
 const headerStyle = {
   margin: 0,
   fontSize: 26,
-  fontWeight: 800,
+  fontWeight: 900,
   letterSpacing: "-0.02em",
 };
 
@@ -35,9 +37,9 @@ const panelStyle = {
   marginTop: 16,
   background: "#ffffff",
   border: "1px solid #e5e7eb",
-  borderRadius: 16,
+  borderRadius: 18,
   padding: 16,
-  boxShadow: "0 8px 20px rgba(17, 24, 39, 0.06)",
+  boxShadow: "0 10px 26px rgba(17, 24, 39, 0.08)",
 };
 
 const rowStyle = {
@@ -52,43 +54,65 @@ const labelStyle = {
   marginBottom: 6,
   fontSize: 13,
   color: "#374151",
-  fontWeight: 600,
+  fontWeight: 700,
+};
+
+const fieldWrap = {
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
 };
 
 const selectStyle = {
   minWidth: 320,
   padding: "10px 12px",
-  borderRadius: 12,
+  borderRadius: 14,
   border: "1px solid #d1d5db",
-  background: "#f9fafb",
+  background: "linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)",
   color: "#111827",
   outline: "none",
+  boxShadow: "0 2px 10px rgba(15, 23, 42, 0.06)",
+  appearance: "none",
+};
+
+const selectFocusStyle = {
+  border: "1px solid #2563eb",
+  boxShadow: "0 0 0 4px rgba(37, 99, 235, 0.18), 0 2px 10px rgba(15, 23, 42, 0.06)",
 };
 
 const buttonStyle = {
   padding: "10px 14px",
-  borderRadius: 12,
+  borderRadius: 14,
   border: "1px solid #1d4ed8",
   background: "#2563eb",
   color: "#ffffff",
   cursor: "pointer",
-  fontWeight: 700,
+  fontWeight: 800,
+  boxShadow: "0 8px 18px rgba(37, 99, 235, 0.18)",
 };
 
 const disabledButtonStyle = {
   ...buttonStyle,
-  opacity: 0.6,
+  opacity: 0.55,
   cursor: "not-allowed",
+  boxShadow: "none",
+};
+
+const secondaryBtn = {
+  ...buttonStyle,
+  background: "#111827",
+  borderColor: "#111827",
+  boxShadow: "0 8px 18px rgba(17, 24, 39, 0.12)",
 };
 
 const errorStyle = {
   marginTop: 10,
   padding: 10,
-  borderRadius: 12,
+  borderRadius: 14,
   border: "1px solid #fecaca",
   background: "#fff1f2",
   color: "#9f1239",
-  fontWeight: 600,
+  fontWeight: 700,
 };
 
 const badgeStyle = (bg, fg) => ({
@@ -96,7 +120,7 @@ const badgeStyle = (bg, fg) => ({
   padding: "4px 10px",
   borderRadius: 999,
   fontSize: 12,
-  fontWeight: 700,
+  fontWeight: 800,
   background: bg,
   color: fg,
   border: `1px solid ${fg}33`,
@@ -106,7 +130,7 @@ const sectionTitle = {
   marginTop: 0,
   marginBottom: 10,
   fontSize: 18,
-  fontWeight: 800,
+  fontWeight: 900,
   color: "#111827",
 };
 
@@ -117,32 +141,34 @@ const grid2 = {
 };
 
 const statCard = {
-  background: "#f9fafb",
+  background: "linear-gradient(180deg, #ffffff 0%, #f9fafb 100%)",
   border: "1px solid #e5e7eb",
-  borderRadius: 14,
+  borderRadius: 16,
   padding: 12,
+  boxShadow: "0 6px 14px rgba(17, 24, 39, 0.06)",
 };
 
 const statLabel = {
   fontSize: 12,
   color: "#6b7280",
-  fontWeight: 700,
+  fontWeight: 800,
   marginBottom: 4,
   textTransform: "uppercase",
-  letterSpacing: "0.04em",
+  letterSpacing: "0.06em",
 };
 
 const statValue = {
   fontSize: 18,
-  fontWeight: 800,
+  fontWeight: 900,
   color: "#111827",
 };
 
 const listCard = (bg) => ({
   background: bg,
   border: "1px solid #e5e7eb",
-  borderRadius: 14,
+  borderRadius: 16,
   padding: 12,
+  boxShadow: "0 6px 14px rgba(17, 24, 39, 0.06)",
 });
 
 const liStyle = {
@@ -150,33 +176,27 @@ const liStyle = {
   lineHeight: 1.35,
 };
 
-// --- NEW: progress indicator styles ---
-const runStatusStyle = {
-  marginTop: 12,
-  color: "#374151",
-  fontWeight: 700,
-};
-
-const spinner = {
-  width: 16,
-  height: 16,
-  borderRadius: "50%",
-  border: "2px solid rgba(255,255,255,0.35)",
-  borderTopColor: "#ffffff",
-  display: "inline-block",
-  animation: "spin 0.9s linear infinite",
-};
-
-const spinnerDark = {
-  ...spinner,
-  border: "2px solid rgba(255,255,255,0.22)",
-  borderTopColor: "#ffffff",
-};
-
 function safeNumber(v) {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+// --- Mini spinner (no dependencies) ---
+function Spinner({ size = 16 }) {
+  return (
+    <span
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "999px",
+        border: "2px solid rgba(255,255,255,0.45)",
+        borderTopColor: "#ffffff",
+        display: "inline-block",
+        animation: "spin 0.8s linear infinite",
+      }}
+    />
+  );
 }
 
 export default function Agents() {
@@ -187,15 +207,16 @@ export default function Agents() {
   const [result, setResult] = useState(null);
   const [err, setErr] = useState("");
   const [showRaw, setShowRaw] = useState(false);
-
-  // --- NEW: running/progress state ---
   const [running, setRunning] = useState(false);
-  const [runningLabel, setRunningLabel] = useState("");
 
-  // Agent lookup
-  const agent = useMemo(() => {
-    return catalog?.agents?.find((a) => a.id === agentId);
-  }, [catalog, agentId]);
+  // For select focus styling
+  const [focusAgent, setFocusAgent] = useState(false);
+  const [focusLoc, setFocusLoc] = useState(false);
+
+  // Optional local tabs (if you want Runbook to look selected on this page)
+  // If your real tab bar is elsewhere, ignore/remove this.
+  const tabs = ["Runbook", "Agentic AI"];
+  const [activeTab, setActiveTab] = useState("Agentic AI"); // mark selected
 
   // 1) Load catalog once
   useEffect(() => {
@@ -230,10 +251,13 @@ export default function Agents() {
     };
   }, []);
 
+  const agent = useMemo(() => {
+    return catalog?.agents?.find((a) => a.id === agentId);
+  }, [catalog, agentId]);
+
   // 2) Auto-select valid location when agent changes
   useEffect(() => {
     if (!agent) return;
-
     const firstLocation = agent.allowed_locations?.[0] || "";
     if (firstLocation && firstLocation !== location) {
       setLocation(firstLocation);
@@ -245,12 +269,7 @@ export default function Agents() {
     setErr("");
     setResult(null);
     setShowRaw(false);
-
-    const label =
-      agentId === "agent-travel" ? "Generating travel plan…" : "Fetching weather…";
-    setRunningLabel(label);
     setRunning(true);
-
     try {
       const data = await apiPost("/api/agent/run", {
         agent_id: agentId,
@@ -261,7 +280,6 @@ export default function Agents() {
       setErr(String(e?.message || e));
     } finally {
       setRunning(false);
-      setRunningLabel("");
     }
   }
 
@@ -271,10 +289,8 @@ export default function Agents() {
 
   // --- Travel view helpers ---
   const travelPlan = result?.travel_plan;
-  const isTravel =
-    !!travelPlan && (String(result?.title || "")).toLowerCase().includes("travel");
-  const isWeather =
-    !!current && (String(result?.title || "")).toLowerCase().includes("weather");
+  const isTravel = !!travelPlan && (result?.title || "").toLowerCase().includes("travel");
+  const isWeather = !!current && (result?.title || "").toLowerCase().includes("weather");
 
   const tripCost = travelPlan?.estimated_cost_usd || {};
   const flights = safeNumber(tripCost?.flights_for_2);
@@ -282,30 +298,60 @@ export default function Agents() {
   const local = safeNumber(tripCost?.local_transport_food);
   const total = safeNumber(tripCost?.total);
 
+  // Tab styles
+  const tabBar = {
+    display: "flex",
+    gap: 10,
+    marginTop: 12,
+    flexWrap: "wrap",
+  };
+
+  const tabStyle = (active) => ({
+    padding: "10px 14px",
+    borderRadius: 14,
+    border: active ? "1px solid #1d4ed8" : "1px solid #e5e7eb",
+    background: active
+      ? "linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%)"
+      : "linear-gradient(180deg, #ffffff 0%, #f3f4f6 100%)",
+    color: active ? "#ffffff" : "#111827",
+    fontWeight: 900,
+    cursor: "pointer",
+    boxShadow: active ? "0 10px 22px rgba(37, 99, 235, 0.22)" : "0 6px 14px rgba(17, 24, 39, 0.06)",
+  });
+
   return (
     <div style={pageStyle}>
-      {/* NEW: keyframes for spinner */}
+      {/* keyframes for spinner */}
       <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
 
       <h2 style={headerStyle}>Agentic AI</h2>
       <p style={subStyle}>
-        Select an agent and run it. Output is displayed inline (no popups). Weather uses Open-Meteo;
-        Travel uses OpenAI.
+        Select an agent and run it. Output is displayed inline (no popups). Weather uses Open-Meteo; Travel uses OpenAI.
       </p>
+
+      {/* Optional: Local tabs so "selected" looks prominent */}
+      <div style={tabBar}>
+        {tabs.map((t) => (
+          <button key={t} onClick={() => setActiveTab(t)} style={tabStyle(activeTab === t)}>
+            {t}
+          </button>
+        ))}
+      </div>
 
       {err && <div style={errorStyle}>Error: {err}</div>}
 
       <div style={panelStyle}>
         <div style={rowStyle}>
-          <div>
+          <div style={fieldWrap}>
             <label style={labelStyle}>Agent</label>
             <select
               value={agentId}
               onChange={(e) => setAgentId(e.target.value)}
-              style={selectStyle}
-              disabled={running || loading}
+              onFocus={() => setFocusAgent(true)}
+              onBlur={() => setFocusAgent(false)}
+              style={focusAgent ? { ...selectStyle, ...selectFocusStyle } : selectStyle}
             >
               {(catalog?.agents || []).map((a) => (
                 <option key={a.id} value={a.id}>
@@ -315,15 +361,16 @@ export default function Agents() {
             </select>
           </div>
 
-          <div>
+          <div style={fieldWrap}>
             <label style={labelStyle}>{agentId === "agent-travel" ? "City" : "Location"}</label>
             <select
               value={location}
               onChange={(e) => setLocation(e.target.value)}
-              style={selectStyle}
-              disabled={running || loading}
+              onFocus={() => setFocusLoc(true)}
+              onBlur={() => setFocusLoc(false)}
+              style={focusLoc ? { ...selectStyle, ...selectFocusStyle } : selectStyle}
             >
-              {(agent?.allowed_locations ?? []).map((loc) => (
+              {(agent?.allowed_locations || []).map((loc) => (
                 <option key={loc} value={loc}>
                   {loc}
                 </option>
@@ -333,13 +380,12 @@ export default function Agents() {
 
           <button
             onClick={runAgent}
-            disabled={running || !location || !agentId}
-            style={running || !location || !agentId ? disabledButtonStyle : buttonStyle}
+            disabled={!location || !agentId || running}
+            style={!location || !agentId || running ? disabledButtonStyle : buttonStyle}
           >
             {running ? (
               <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
-                <span style={spinner} />
-                Running…
+                <Spinner size={16} /> Running…
               </span>
             ) : (
               "Run"
@@ -348,29 +394,13 @@ export default function Agents() {
 
           <button
             onClick={() => setShowRaw((s) => !s)}
-            disabled={running || !result}
-            style={
-              running || !result
-                ? disabledButtonStyle
-                : { ...buttonStyle, background: "#111827", borderColor: "#111827" }
-            }
+            disabled={!result}
+            style={!result ? disabledButtonStyle : secondaryBtn}
             title="Show/hide raw JSON (inline)"
           >
-            {running ? (
-              <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
-                <span style={spinnerDark} />
-                Working…
-              </span>
-            ) : showRaw ? (
-              "Hide raw JSON"
-            ) : (
-              "Show raw JSON"
-            )}
+            {showRaw ? "Hide raw JSON" : "Show raw JSON"}
           </button>
         </div>
-
-        {/* NEW: inline status line */}
-        {running && <div style={runStatusStyle}>{runningLabel || "Working…"}</div>}
 
         {loading && <p style={{ marginTop: 14, color: "#374151" }}>Loading agents…</p>}
 
@@ -378,7 +408,7 @@ export default function Agents() {
         {result && (
           <div style={{ marginTop: 16 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 900 }}>{result.title || "Result"}</h3>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 950 }}>{result.title || "Result"}</h3>
               {isWeather && <span style={badgeStyle("#ecfeff", "#0e7490")}>WEATHER</span>}
               {isTravel && <span style={badgeStyle("#f5f3ff", "#5b21b6")}>TRAVEL</span>}
             </div>
@@ -429,7 +459,6 @@ export default function Agents() {
             {/* -------- Pretty Travel -------- */}
             {isTravel && (
               <div style={{ marginTop: 12 }}>
-                {/* Weather outlook */}
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                   <span style={badgeStyle("#eef2ff", "#3730a3")}>
                     Next 2 days: {travelPlan?.weather_outlook?.next_2_days || "—"}
@@ -439,7 +468,6 @@ export default function Agents() {
                   </span>
                 </div>
 
-                {/* Itineraries in different colors */}
                 <div
                   style={{
                     marginTop: 12,
@@ -471,7 +499,6 @@ export default function Agents() {
                   </div>
                 </div>
 
-                {/* Costs */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ ...sectionTitle, marginBottom: 8 }}>Estimated Cost (USD)</div>
                   <div style={grid2}>
@@ -494,7 +521,6 @@ export default function Agents() {
                   </div>
                 </div>
 
-                {/* Tips */}
                 <div style={{ marginTop: 12, ...listCard("#fff7ed") }}>
                   <div style={{ ...sectionTitle, color: "#9a3412" }}>Travel Tips</div>
                   <ul style={{ margin: 0, paddingLeft: 18 }}>
@@ -506,7 +532,6 @@ export default function Agents() {
                   </ul>
                 </div>
 
-                {/* If travel_plan returned an error */}
                 {travelPlan?.error && (
                   <div style={{ ...errorStyle, marginTop: 12 }}>
                     Travel agent error: {String(travelPlan.error)}
@@ -515,7 +540,6 @@ export default function Agents() {
               </div>
             )}
 
-            {/* Raw JSON toggle (inline) */}
             {showRaw && (
               <div style={{ marginTop: 12 }}>
                 <div style={{ ...sectionTitle, marginBottom: 8 }}>Raw JSON</div>
@@ -525,11 +549,12 @@ export default function Agents() {
                     background: "#0b1020",
                     color: "#e5e7eb",
                     padding: 12,
-                    borderRadius: 14,
+                    borderRadius: 16,
                     border: "1px solid #111827",
                     overflowX: "auto",
                     fontSize: 12,
-                    lineHeight: 1.4,
+                    lineHeight: 1.5,
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.20)",
                   }}
                 >
                   {JSON.stringify(result, null, 2)}
