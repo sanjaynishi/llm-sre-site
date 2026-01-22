@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
-import Runbook from "./pages/Runbooks";   // adjust paths if yours differ
-import Rag from "./pages/Rag";           // adjust paths if yours differ
-import Agents from "./pages/Agents";     // adjust paths if yours differ
+import Runbook from "./pages/Runbooks"; // ✅ your file name
+import Rag from "./pages/Rag";
+import Agents from "./pages/Agents";
 
 const appWrap = {
   minHeight: "100vh",
@@ -19,18 +19,31 @@ const shell = {
 
 const titleRow = {
   display: "flex",
-  justifyContent: "space-between",
-  alignItems: "end",
-  flexWrap: "wrap",
-  gap: 10,
+  justifyContent: "center",
+  alignItems: "center",
+  textAlign: "center",
+  marginTop: 6,
 };
 
-const title = { margin: 0, fontSize: 28, fontWeight: 900, letterSpacing: "-0.02em" };
-const subtitle = { marginTop: 6, marginBottom: 0, color: "#4b5563", lineHeight: 1.35 };
+const title = {
+  margin: 0,
+  fontSize: 30,
+  fontWeight: 900,
+  letterSpacing: "-0.02em",
+};
+
+const subtitle = {
+  marginTop: 8,
+  marginBottom: 0,
+  color: "#4b5563",
+  lineHeight: 1.35,
+  maxWidth: 820,
+};
 
 const tabsRow = {
-  marginTop: 14,
+  marginTop: 16,
   display: "flex",
+  justifyContent: "center",
   gap: 10,
   flexWrap: "wrap",
   alignItems: "center",
@@ -45,17 +58,19 @@ const tabBase = {
   fontWeight: 900,
   cursor: "pointer",
   boxShadow: "0 6px 14px rgba(17, 24, 39, 0.06)",
+  transition: "transform 120ms ease, box-shadow 120ms ease, border 120ms ease",
 };
 
 const tabActive = {
-  border: "1px solid #1d4ed8",
+  border: "2px solid #1d4ed8",
   background: "linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%)",
   color: "#ffffff",
-  boxShadow: "0 10px 22px rgba(37, 99, 235, 0.22)",
+  boxShadow: "0 14px 28px rgba(37, 99, 235, 0.26)",
+  transform: "translateY(-1px)",
 };
 
 const contentCard = {
-  marginTop: 14,
+  marginTop: 16,
   background: "#ffffff",
   border: "1px solid #e5e7eb",
   borderRadius: 18,
@@ -80,7 +95,7 @@ export default function App() {
       <div style={shell}>
         <div style={titleRow}>
           <div>
-            <h1 style={title}>SRE / DevOps</h1>
+            <h1 style={title}>AIML LLM SRE / DevOps</h1>
             <p style={subtitle}>
               Runbooks, RAG tools, and Agentic AI utilities — all inline (no popups).
             </p>
@@ -93,6 +108,7 @@ export default function App() {
               key={t.key}
               onClick={() => setActive(t.key)}
               style={{ ...tabBase, ...(active === t.key ? tabActive : {}) }}
+              aria-pressed={active === t.key}
             >
               {t.label}
             </button>
