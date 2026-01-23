@@ -1,17 +1,16 @@
 """
 LLM SRE Agent API (Lambda)
 
-Existing endpoints:
+Endpoints (behind CloudFront /api/*):
+  GET  /api/health
   GET  /api/agents
   POST /api/agent/run
-  OPTIONS *
+  POST /api/runbooks/ask   body: { "question": "...", "top_k": 5 }
+  OPTIONS *                CORS preflight
 
-New RAG endpoint:
-  POST /api/runbooks/ask
-    body: { "question": "...", "top_k": 5 }
-
-Vectors:
-  Downloads Chroma persistent store from S3 into /tmp on cold start.
+RAG:
+  - Downloads Chroma persistent store from S3 into /tmp on first use
+  - Uses OpenAI embeddings via HTTPS (no openai SDK)
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Tuple, List, Dict
+from typing import Any, List, Dict, Tuple
 
 try:
     import boto3
@@ -31,12 +30,6 @@ try:
 except Exception:
     boto3 = None
     ClientError = Exception
-
-from openai import OpenAI
-
-# Chroma deps are present because we're using container image
-import chromadb
-from chromadb.config import Settings
 
 
 # ---------------- Config ----------------
@@ -50,30 +43,37 @@ ALLOWED_ORIGINS = {
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2").strip()
 
-S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()  # your config bucket
+# Bucket that holds config + runbooks + vectors (you’re using agent-config bucket)
+S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
 S3_PREFIX = os.environ.get("S3_PREFIX", "knowledge/").strip()
 
-# RAG
+# RAG vectors location (within S3_BUCKET)
 VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma/").strip()
 CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "runbooks_dev").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
 
-# Local path in Lambda ephemeral storage
+# Local ephemeral storage
 CHROMA_LOCAL_DIR = "/tmp/chroma_store"
+
+# Agent catalog defaults (simple, you can replace with S3 later)
+DEFAULT_AGENTS = {
+    "agents": [
+        {"id": "agent-runbooks", "category": "Runbooks", "label": "Ask runbooks (RAG)", "mode": "rag_runbooks"},
+        {"id": "agent-travel", "category": "Demo", "label": "Travel plan (OpenAI via HTTPS)", "mode": "tool_travel"},
+    ]
+}
 
 # Warm caches
 _s3 = None
-_chroma_client = None
 _chroma_collection = None
-_openai_client = None
 
 
-# ---------------- Helpers ----------------
+# ---------------- Basic helpers ----------------
 
 def _s3_client():
     global _s3
     if boto3 is None:
-        raise RuntimeError("boto3 not available")
+        raise RuntimeError("boto3 not available in runtime")
     if _s3 is None:
         _s3 = boto3.client("s3")
     return _s3
@@ -110,8 +110,7 @@ def _get_method(event: dict) -> str:
 def _get_path(event: dict) -> str:
     # HTTP API v2: rawPath; REST: path
     path = event.get("rawPath") or event.get("path") or "/"
-    # If CloudFront forwards /api/* but API Gateway route expects /...,
-    # you can normalize here if needed.
+    # Normalize CloudFront /api/* -> API routes /...
     if path.startswith("/api/"):
         path = path[4:]  # remove "/api"
     return path
@@ -123,23 +122,78 @@ def _get_body_json(event: dict) -> dict:
         return {}
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8")
-    return json.loads(body)
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON body: {e}") from e
 
 
-def _ensure_openai():
-    global _openai_client
-    if _openai_client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    return _openai_client
+# ---------------- OpenAI HTTPS helpers (NO SDK) ----------------
+
+def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "User-Agent": "llm-sre-agent/1.0"}
+    if headers:
+        req_headers.update(headers)
+
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:800] + "...") if len(detail) > 800 else detail
+        raise RuntimeError(f"HTTP {e.code} POST {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error POST {url} :: {e}") from e
 
 
-# ---------------- S3 download folder ----------------
+def _openai_headers() -> dict:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+
+def _openai_embed(text: str) -> List[float]:
+    """
+    Calls OpenAI embeddings endpoint via HTTPS.
+    """
+    url = "https://api.openai.com/v1/embeddings"
+    payload = {"model": EMBED_MODEL, "input": [text]}
+    resp = _http_post_json(url, payload, headers=_openai_headers(), timeout_sec=25)
+
+    # Expected: {"data":[{"embedding":[...]}], ...}
+    data = resp.get("data") or []
+    if not data or not isinstance(data, list) or not data[0].get("embedding"):
+        raise RuntimeError(f"Embeddings API returned unexpected payload: {str(resp)[:400]}")
+    return data[0]["embedding"]
+
+
+def _openai_answer(prompt: str) -> str:
+    """
+    Calls OpenAI Responses endpoint via HTTPS.
+    """
+    url = "https://api.openai.com/v1/responses"
+    payload = {"model": OPENAI_MODEL, "input": prompt, "max_output_tokens": 700}
+    resp = _http_post_json(url, payload, headers=_openai_headers(), timeout_sec=25)
+
+    # Extract output text
+    out_text = ""
+    for item in resp.get("output", []) or []:
+        if item.get("type") == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") in ("output_text", "text"):
+                    out_text += c.get("text", "")
+    out_text = (out_text or "").strip() or (resp.get("output_text") or "").strip()
+    return out_text or "No answer returned."
+
+
+# ---------------- S3 download helpers ----------------
 
 def _s3_list_keys(bucket: str, prefix: str) -> List[str]:
     s3 = _s3_client()
-    keys = []
+    keys: List[str] = []
     token = None
     while True:
         kwargs = {"Bucket": bucket, "Prefix": prefix}
@@ -167,7 +221,6 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     if not keys:
         raise RuntimeError(f"No objects found at s3://{bucket}/{prefix}")
 
-    # clean target dir
     if os.path.isdir(local_dir):
         shutil.rmtree(local_dir, ignore_errors=True)
     os.makedirs(local_dir, exist_ok=True)
@@ -182,14 +235,14 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     return count
 
 
-# ---------------- Chroma init/query ----------------
+# ---------------- Chroma init/query (LAZY IMPORT) ----------------
 
-def _ensure_chroma():
+def _ensure_chroma_collection():
     """
     Cold-start: download vector store from S3 -> /tmp, then open Chroma.
     Warm-start: reuse globals.
     """
-    global _chroma_client, _chroma_collection
+    global _chroma_collection
 
     if _chroma_collection is not None:
         return _chroma_collection
@@ -199,29 +252,32 @@ def _ensure_chroma():
     if not VECTORS_PREFIX:
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
-    # Download store on first use
-    downloaded = _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
+    # Lazy import so Lambda ZIP doesn’t crash if chromadb isn't packaged
+    try:
+        import chromadb
+        from chromadb.config import Settings
+    except Exception as e:
+        raise RuntimeError(
+            "chromadb not available in this Lambda package. "
+            "Either (a) switch to container-image Lambda, or (b) remove RAG imports."
+        ) from e
 
-    _chroma_client = chromadb.PersistentClient(
+    _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
+
+    client = chromadb.PersistentClient(
         path=CHROMA_LOCAL_DIR,
         settings=Settings(anonymized_telemetry=False),
     )
-    _chroma_collection = _chroma_client.get_collection(CHROMA_COLLECTION)
+    _chroma_collection = client.get_collection(CHROMA_COLLECTION)
 
-    # simple sanity check
+    # sanity check
     _ = _chroma_collection.count()
     return _chroma_collection
 
 
-def _embed_text(text: str) -> List[float]:
-    client = _ensure_openai()
-    emb = client.embeddings.create(model=EMBED_MODEL, input=[text])
-    return emb.data[0].embedding
-
-
 def _retrieve_chunks(question: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    col = _ensure_chroma()
-    q_emb = _embed_text(question)
+    col = _ensure_chroma_collection()
+    q_emb = _openai_embed(question)
 
     res = col.query(
         query_embeddings=[q_emb],
@@ -229,33 +285,27 @@ def _retrieve_chunks(question: str, top_k: int = 5) -> List[Dict[str, Any]]:
         include=["documents", "metadatas", "distances"],
     )
 
-    out = []
+    out: List[Dict[str, Any]] = []
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
 
     for doc, meta, dist in zip(docs, metas, dists):
-        out.append({
-            "text": doc,
-            "meta": meta,
-            "distance": dist,
-        })
+        out.append({"text": doc, "meta": meta, "distance": dist})
     return out
 
 
 def _answer_with_llm(question: str, contexts: List[Dict[str, Any]]) -> str:
-    client = _ensure_openai()
-
-    # Build context block with light citations
+    # Build context block with citations
     ctx_lines = []
     for i, c in enumerate(contexts, start=1):
         meta = c.get("meta") or {}
         src = meta.get("file") or meta.get("s3_key") or "runbook"
         chunk = meta.get("chunk")
-        label = f"[{i}] {src} (chunk {chunk})"
+        label = f"[{i}] {src}" + (f" (chunk {chunk})" if chunk is not None else "")
         ctx_lines.append(f"{label}\n{c.get('text','')}\n")
 
-    context_block = "\n".join(ctx_lines)[:14000]  # keep prompt bounded
+    context_block = "\n".join(ctx_lines)[:14000]
 
     prompt = f"""
 You are an SRE runbook assistant. Answer the user's question using ONLY the provided runbook excerpts.
@@ -275,24 +325,43 @@ Runbook excerpts:
 {context_block}
 """.strip()
 
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-        max_output_tokens=700,
-    )
-
-    # Extract output text
-    out_text = ""
-    for item in resp.output or []:
-        if getattr(item, "type", None) == "message":
-            for c in item.content or []:
-                if getattr(c, "type", None) in ("output_text", "text"):
-                    out_text += c.text or ""
-    out_text = (out_text or "").strip() or (getattr(resp, "output_text", "") or "").strip()
-    return out_text or "No answer returned."
+    return _openai_answer(prompt)
 
 
-# ---------------- Handlers ----------------
+# ---------------- Endpoint handlers ----------------
+
+def _handle_get_health(event: dict) -> dict:
+    return _json_response(event, 200, {"ok": True})
+
+
+def _handle_get_agents(event: dict) -> dict:
+    # Later you can load agents.json from S3. For now return defaults.
+    return _json_response(event, 200, DEFAULT_AGENTS)
+
+
+def _handle_post_agent_run(event: dict) -> dict:
+    """
+    Demo placeholder: keeps existing endpoint alive.
+    You can extend this to run tools/agents.
+    """
+    req = _get_body_json(event)
+    agent_id = (req.get("agent_id") or "").strip()
+    location = (req.get("location") or "").strip()
+
+    if not agent_id:
+        return _json_response(event, 400, {"error": {"code": "MISSING_AGENT", "message": "agent_id is required"}})
+
+    # Minimal demo: travel agent via OpenAI HTTPS
+    if agent_id == "agent-travel":
+        if not location:
+            return _json_response(event, 400, {"error": {"code": "MISSING_LOCATION", "message": "location is required"}})
+
+        prompt = f"Give a concise 2-day travel plan for {location}. Return plain text."
+        answer = _openai_answer(prompt)
+        return _json_response(event, 200, {"result": {"title": f"Travel plan: {location}", "text": answer}})
+
+    return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": f"Unknown agent_id: {agent_id}"}})
+
 
 def _handle_post_runbooks_ask(event: dict) -> dict:
     req = _get_body_json(event)
@@ -308,15 +377,23 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
 
-    return _json_response(event, 200, {
-        "question": question,
-        "top_k": top_k,
-        "sources": [
-            {"file": (c["meta"] or {}).get("file"), "s3_key": (c["meta"] or {}).get("s3_key"), "chunk": (c["meta"] or {}).get("chunk")}
-            for c in contexts
-        ],
-        "answer": answer
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "question": question,
+            "top_k": top_k,
+            "sources": [
+                {
+                    "file": (c["meta"] or {}).get("file"),
+                    "s3_key": (c["meta"] or {}).get("s3_key"),
+                    "chunk": (c["meta"] or {}).get("chunk"),
+                }
+                for c in contexts
+            ],
+            "answer": answer,
+        },
+    )
 
 
 # ---------------- Lambda entry ----------------
@@ -325,10 +402,27 @@ def lambda_handler(event: dict, context: Any) -> dict:
     method = _get_method(event)
     path = _get_path(event)
 
+    # CORS preflight
     if method == "OPTIONS":
         return _json_response(event, 200, {"ok": True})
 
-    if method == "POST" and path == "/runbooks/ask":
+    # Health (always cheap, no deps)
+    if method == "GET" and (path == "/health" or path.endswith("/health")):
+        return _handle_get_health(event)
+
+    # Agents catalog
+    if method == "GET" and (path == "/agents" or path.endswith("/agents")):
+        return _handle_get_agents(event)
+
+    # Run selected agent
+    if method == "POST" and (path == "/agent/run" or path.endswith("/agent/run")):
+        try:
+            return _handle_post_agent_run(event)
+        except Exception as e:
+            return _json_response(event, 500, {"error": {"code": "AGENT_FAILED", "message": str(e)}})
+
+    # RAG runbooks Q&A
+    if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
         try:
             return _handle_post_runbooks_ask(event)
         except Exception as e:
