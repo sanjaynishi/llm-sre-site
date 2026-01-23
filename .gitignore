@@ -13,3 +13,5 @@ terraform.tfstate.backup
 # Secrets
 .env
 .env.*
+.venv
+.venv/*

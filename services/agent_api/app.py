@@ -707,7 +707,6 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
         },
     )
 
-
 # ---------------- Lambda entry ----------------
 
 def lambda_handler(event: dict, context: Any) -> dict:
