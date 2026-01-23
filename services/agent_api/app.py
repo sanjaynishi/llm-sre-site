@@ -3,18 +3,14 @@ LLM SRE Agent API (Lambda)
 
 Endpoints (behind CloudFront /api/*):
   GET  /api/health         -> basic health
-  GET  /api/agents         -> returns agent catalog (Weather + Travel) with allowed_locations
+  GET  /api/agents         -> Weather + Travel agents (dropdown + locations)
   POST /api/agent/run      -> runs selected agent (weather/travel)
   POST /api/runbooks/ask   -> RAG Q&A over runbooks (question-based, no location)
   OPTIONS *                -> CORS preflight
 
-Notes:
-- /api/agents MUST return only location-based agents used by /api/agent/run.
-  Do NOT include the RAG agent here (it breaks the UI dropdown by making "location" null).
-- RAG uses /api/runbooks/ask and expects {"question": "...", "top_k": 5}.
-
-RAG storage:
-- Downloads Chroma persistent store from S3 into /tmp on first query (cold start).
+Key UI rule:
+- /api/agents MUST ONLY include agents that use /api/agent/run (location dropdown flow).
+  RAG agent is question-based, so keep it OUT of /api/agents.
 """
 
 from __future__ import annotations
@@ -30,18 +26,8 @@ from typing import Any, Tuple, List, Dict
 
 try:
     import boto3
-    from botocore.exceptions import ClientError
 except Exception:
     boto3 = None
-    ClientError = Exception
-
-# OpenAI SDK is required ONLY if you're using container image or you packaged it.
-# If you are running ZIP Lambda without dependencies, remove this and use stdlib HTTPS calls instead.
-from openai import OpenAI
-
-# Chroma deps are present only if you're using container image
-import chromadb
-from chromadb.config import Settings
 
 
 # ---------------- Config ----------------
@@ -55,22 +41,18 @@ ALLOWED_ORIGINS = {
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2").strip()
 
-# Existing S3 config (agents.json / allowlists.json)
+# S3 config for agents.json / allowlists.json
 AGENT_CONFIG_BUCKET = os.environ.get("AGENT_CONFIG_BUCKET", "").strip()
 AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").strip()
 
-# Runbooks + vectors storage (can be same bucket)
+# RAG / vectors storage (can be same bucket)
 S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
-S3_PREFIX = os.environ.get("S3_PREFIX", "knowledge/").strip()
-
-# RAG / vectors
 VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma/").strip()
 CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "runbooks_dev").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
 
 CHROMA_LOCAL_DIR = "/tmp/chroma_store"
 
-# Defaults (fallback if S3 config missing)
 DEFAULT_ALLOWED_LOCATIONS = sorted([
     "New York, NY",
     "San Francisco, CA",
@@ -91,10 +73,11 @@ DEFAULT_TRAVEL_CITIES = sorted([
 AGENT_ID_WEATHER = "agent-weather"
 AGENT_ID_TRAVEL = "agent-travel"
 
-# Warm caches / globals
+# Warm caches
 _s3 = None
 _config_cache = {"agents": None, "allowlists": None}
 
+# Warm caches for RAG (initialized lazily)
 _openai_client = None
 _chroma_client = None
 _chroma_collection = None
@@ -105,7 +88,7 @@ _chroma_collection = None
 def _s3_client():
     global _s3
     if boto3 is None:
-        raise RuntimeError("boto3 not available")
+        raise RuntimeError("boto3 not available in this Lambda runtime")
     if _s3 is None:
         _s3 = boto3.client("s3")
     return _s3
@@ -140,9 +123,7 @@ def _get_method(event: dict) -> str:
 
 
 def _get_path(event: dict) -> str:
-    # HTTP API v2: rawPath; REST: path
     path = event.get("rawPath") or event.get("path") or "/"
-    # CloudFront forwards /api/*, but API Gateway routes are /...
     if path.startswith("/api/"):
         path = path[4:]  # remove "/api"
     return path
@@ -160,31 +141,21 @@ def _get_body_json(event: dict) -> dict:
         raise ValueError(f"Invalid JSON body: {e}") from e
 
 
-def _ensure_openai():
-    global _openai_client
-    if _openai_client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    return _openai_client
-
-
 # ---------------- S3 config (agents/allowlists) ----------------
 
 def _s3_get_json(bucket: str, key: str) -> dict:
+    # MUST NEVER throw for /agents path
     try:
         resp = _s3_client().get_object(Bucket=bucket, Key=key)
         raw = resp["Body"].read().decode("utf-8")
         return json.loads(raw)
-    except Exception:
+    except Exception as e:
+        # Log for debugging, but return empty so we can fall back cleanly
+        print(f"S3 read failed: s3://{bucket}/{key} :: {e}")
         return {}
 
 
 def _load_agent_config() -> Tuple[dict, dict]:
-    """
-    Returns (agents_json, allowlists_json) from S3 if configured.
-    Uses warm Lambda cache; falls back to ({},{}) if missing.
-    """
     if not AGENT_CONFIG_BUCKET:
         return {}, {}
 
@@ -214,13 +185,6 @@ def _normalize_str_list(value: Any) -> List[str]:
 
 
 def _effective_allowlists() -> Tuple[List[str], List[str]]:
-    """
-    allowlists.json format:
-      {
-        "weather_locations": [...],
-        "travel_cities": [...]
-      }
-    """
     _, allow_cfg = _load_agent_config()
 
     weather_locations = _normalize_str_list(allow_cfg.get("weather_locations")) if isinstance(allow_cfg, dict) else []
@@ -319,11 +283,21 @@ def fetch_weather(lat: float, lon: float) -> dict:
     return _http_get_json(url)
 
 
-# ---------------- Travel (OpenAI) ----------------
+# ---------------- Lazy OpenAI + Chroma (only used for Travel + RAG) ----------------
+
+def _ensure_openai():
+    global _openai_client
+    if _openai_client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not configured")
+        # lazy import
+        from openai import OpenAI  # noqa
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
+
 
 def get_travel_info(city: str) -> dict:
-    if not OPENAI_API_KEY:
-        return {"error": "OPENAI_API_KEY not configured"}
+    client = _ensure_openai()
 
     prompt = f"""
 You are a travel planning assistant.
@@ -355,14 +329,12 @@ Rules:
 - No markdown; JSON only
 """.strip()
 
-    client = _ensure_openai()
     resp = client.responses.create(
         model=OPENAI_MODEL,
         input=prompt,
         max_output_tokens=650,
     )
 
-    # Extract output text
     out_text = ""
     for item in resp.output or []:
         if getattr(item, "type", None) == "message":
@@ -374,11 +346,9 @@ Rules:
     if not out_text:
         return {"error": "OpenAI returned empty output"}
 
-    # Try parse JSON (best effort)
     try:
         data = json.loads(out_text)
     except Exception:
-        # fallback: attempt to extract first {...}
         start = out_text.find("{")
         end = out_text.rfind("}")
         candidate = out_text[start:end + 1] if start != -1 and end != -1 and end > start else out_text
@@ -387,7 +357,6 @@ Rules:
         except Exception:
             return {"error": "Failed to parse JSON from model", "raw_output": out_text[:1200]}
 
-    # Sanity-check total
     try:
         c = data.get("estimated_cost_usd", {})
         parts = (
@@ -402,8 +371,6 @@ Rules:
 
     return data
 
-
-# ---------------- RAG helpers (Chroma in /tmp) ----------------
 
 def _s3_list_keys(bucket: str, prefix: str) -> List[str]:
     s3 = _s3_client()
@@ -426,10 +393,6 @@ def _s3_list_keys(bucket: str, prefix: str) -> List[str]:
 
 
 def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
-    """
-    Downloads all objects under prefix into local_dir (preserving relative paths).
-    Returns number of files downloaded.
-    """
     s3 = _s3_client()
     keys = _s3_list_keys(bucket, prefix)
     if not keys:
@@ -450,12 +413,7 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
 
 
 def _ensure_chroma():
-    """
-    Cold-start: download vector store from S3 -> /tmp, then open Chroma.
-    Warm-start: reuse globals.
-    """
     global _chroma_client, _chroma_collection
-
     if _chroma_collection is not None:
         return _chroma_collection
 
@@ -465,6 +423,10 @@ def _ensure_chroma():
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
     _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
+
+    # lazy import
+    import chromadb  # noqa
+    from chromadb.config import Settings  # noqa
 
     _chroma_client = chromadb.PersistentClient(
         path=CHROMA_LOCAL_DIR,
@@ -556,9 +518,8 @@ def _handle_get_health(event: dict) -> dict:
 
 def _handle_get_agents(event: dict) -> dict:
     """
-    Returns the agent catalog for the UI dropdown.
-    IMPORTANT: Only include agents that use /api/agent/run (location dropdown flow).
-    Do NOT include the RAG agent here (it uses /api/runbooks/ask and a question input).
+    Always return Weather + Travel agents with allowed_locations.
+    Never throw (UI depends on this).
     """
     default_agents = {
         "agents": [
@@ -583,27 +544,34 @@ def _handle_get_agents(event: dict) -> dict:
         agents_cfg, _ = _load_agent_config()
         weather_locations, travel_cities = _effective_allowlists()
 
+        merged = {"agents": []}
+
+        # If agents.json exists, we merge labels/categories/modes from there,
+        # but we ALWAYS enforce allowed_locations for weather/travel.
         if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
-            merged = {"agents": []}
             for a in agents_cfg["agents"]:
                 if not isinstance(a, dict) or not a.get("id"):
                     continue
+                aid = a.get("id")
 
-                a2 = dict(a)
-
-                # Only include supported dropdown agents
-                if a2["id"] == AGENT_ID_WEATHER:
+                if aid == AGENT_ID_WEATHER:
+                    a2 = dict(a)
                     a2["allowed_locations"] = weather_locations
                     merged["agents"].append(a2)
-                elif a2["id"] == AGENT_ID_TRAVEL:
+
+                elif aid == AGENT_ID_TRAVEL:
+                    a2 = dict(a)
                     a2["allowed_locations"] = travel_cities
                     merged["agents"].append(a2)
 
-            if merged["agents"]:
-                return _json_response(event, 200, merged)
+        # If S3 config didn't include weather/travel, fall back.
+        if not merged["agents"]:
+            return _json_response(event, 200, default_agents)
 
-        return _json_response(event, 200, default_agents)
-    except Exception:
+        return _json_response(event, 200, merged)
+
+    except Exception as e:
+        print(f"/agents fallback due to error: {e}")
         return _json_response(event, 200, default_agents)
 
 
@@ -687,7 +655,29 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     # Agents catalog (Weather + Travel only)
     if method == "GET" and (path == "/agents" or path.endswith("/agents")):
-        return _handle_get_agents(event)
+        # never throw for UI
+        try:
+            return _handle_get_agents(event)
+        except Exception as e:
+            print(f"/agents hard-fallback due to unexpected error: {e}")
+            return _json_response(event, 200, {
+                "agents": [
+                    {
+                        "id": AGENT_ID_WEATHER,
+                        "category": "Weather",
+                        "label": "Weather information (full details)",
+                        "mode": "tool_weather",
+                        "allowed_locations": DEFAULT_ALLOWED_LOCATIONS,
+                    },
+                    {
+                        "id": AGENT_ID_TRAVEL,
+                        "category": "Travel",
+                        "label": "Travel planner (AI-powered)",
+                        "mode": "tool_travel",
+                        "allowed_locations": DEFAULT_TRAVEL_CITIES,
+                    },
+                ]
+            })
 
     # Agent run (location-based)
     if method == "POST" and (path == "/agent/run" or path.endswith("/agent/run")):
