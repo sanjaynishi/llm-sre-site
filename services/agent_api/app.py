@@ -16,7 +16,7 @@ Important deployment note:
 - This file is safe even if 'openai' or 'chromadb' are NOT installed.
   - Weather will still work.
   - /api/agents will still work (never throws).
-  - Travel will return a clear error if openai is missing.
+  - Travel will return a clear error if openai is missing / API fails.
   - RAG will return a clear error if openai/chromadb are missing.
 """
 
@@ -60,6 +60,7 @@ CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "runbooks_dev").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
 
 CHROMA_LOCAL_DIR = "/tmp/chroma_store"
+CHROMA_MARKER_FILE = os.path.join(CHROMA_LOCAL_DIR, ".download_ok")
 
 DEFAULT_ALLOWED_LOCATIONS = sorted(
     [
@@ -79,7 +80,7 @@ DEFAULT_TRAVEL_CITIES = sorted(
         "New York",
         "Tokyo",
         "Rome",
-        "Delhi",  # keep if your UI previously had it
+        "Delhi",
     ]
 )
 
@@ -119,7 +120,8 @@ def _json_response(event: dict, status_code: int, body: dict, extra_headers: dic
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": cors_origin,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        # IMPORTANT: keep in sync with API Gateway CORS and allow common auth headers
+        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
         "Vary": "Origin",
     }
     if extra_headers:
@@ -174,6 +176,7 @@ def _load_agent_config() -> Tuple[dict, dict]:
     if not AGENT_CONFIG_BUCKET:
         return {}, {}
 
+    # in-memory cache (warm invocations)
     if _config_cache["agents"] is not None and _config_cache["allowlists"] is not None:
         return _config_cache["agents"], _config_cache["allowlists"]
 
@@ -210,7 +213,7 @@ def _effective_allowlists() -> Tuple[List[str], List[str]]:
     if not travel_cities:
         travel_cities = DEFAULT_TRAVEL_CITIES
 
-    return weather_locations, travel_cities
+    return sorted(weather_locations), sorted(travel_cities)
 
 
 # ---------------- HTTP helpers (stdlib) ----------------
@@ -255,7 +258,7 @@ def _extract_json_object(text: str) -> str:
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return text
-    return text[start : end + 1]
+    return text[start: end + 1]
 
 
 # ---------------- Weather (Open-Meteo) ----------------
@@ -422,7 +425,7 @@ Rules:
 
     # Sanity-check total
     try:
-        c = data.get("estimated_cost_usd", {})
+        c = data.get("estimated_cost_usd", {}) or {}
         parts = (
             float(c.get("flights_for_2", 0))
             + float(c.get("hotel_4_star_5_nights", 0))
@@ -464,6 +467,7 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     if not keys:
         raise RuntimeError(f"No objects found at s3://{bucket}/{prefix}")
 
+    # Ensure clean local dir
     if os.path.isdir(local_dir):
         shutil.rmtree(local_dir, ignore_errors=True)
     os.makedirs(local_dir, exist_ok=True)
@@ -475,6 +479,14 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         s3.download_file(bucket, key, dest)
         count += 1
+
+    # marker file to avoid re-downloads during warm invocations
+    try:
+        with open(CHROMA_MARKER_FILE, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+    except Exception:
+        pass
+
     return count
 
 
@@ -494,7 +506,16 @@ def _ensure_chroma():
     if not VECTORS_PREFIX:
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
-    _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
+    # Only download if the local store isn't already present (warm container)
+    needs_download = True
+    try:
+        if os.path.isdir(CHROMA_LOCAL_DIR) and os.path.isfile(CHROMA_MARKER_FILE) and os.listdir(CHROMA_LOCAL_DIR):
+            needs_download = False
+    except Exception:
+        needs_download = True
+
+    if needs_download:
+        _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
 
     try:
         import chromadb  # type: ignore
@@ -506,6 +527,8 @@ def _ensure_chroma():
         path=CHROMA_LOCAL_DIR,
         settings=Settings(anonymized_telemetry=False),
     )
+
+    # Collection must exist in the persisted store; otherwise this will throw clearly
     _chroma_collection = _chroma_client.get_collection(CHROMA_COLLECTION)
     _ = _chroma_collection.count()
     return _chroma_collection
@@ -596,33 +619,31 @@ def _handle_get_agents(event: dict) -> dict:
     Never throw (UI depends on this).
     IMPORTANT: Do NOT include RAG agent here.
     """
-    default_agents = {
+    weather_locations, travel_cities = _effective_allowlists()
+
+    # Start with safe defaults (so we never “drop” an agent)
+    merged = {
         "agents": [
             {
                 "id": AGENT_ID_WEATHER,
                 "category": "Weather",
                 "label": "Weather information (full details)",
                 "mode": "tool_weather",
-                "allowed_locations": DEFAULT_ALLOWED_LOCATIONS,
+                "allowed_locations": weather_locations,
             },
             {
                 "id": AGENT_ID_TRAVEL,
                 "category": "Travel",
                 "label": "Travel planner (AI-powered)",
                 "mode": "tool_travel",
-                "allowed_locations": DEFAULT_TRAVEL_CITIES,
+                "allowed_locations": travel_cities,
             },
         ]
     }
 
+    # Overlay labels/categories/modes from S3 agents.json if present
     try:
         agents_cfg, _ = _load_agent_config()
-        weather_locations, travel_cities = _effective_allowlists()
-
-        merged = {"agents": []}
-
-        # If agents.json exists, merge labels/categories/modes from there,
-        # but ALWAYS enforce allowed_locations for weather/travel.
         if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
             for a in agents_cfg["agents"]:
                 if not isinstance(a, dict) or not a.get("id"):
@@ -630,24 +651,13 @@ def _handle_get_agents(event: dict) -> dict:
                 aid = a.get("id")
 
                 if aid == AGENT_ID_WEATHER:
-                    a2 = dict(a)
-                    a2["allowed_locations"] = weather_locations
-                    merged["agents"].append(a2)
-
+                    merged["agents"][0].update({k: v for k, v in a.items() if k in ("category", "label", "mode")})
                 elif aid == AGENT_ID_TRAVEL:
-                    a2 = dict(a)
-                    a2["allowed_locations"] = travel_cities
-                    merged["agents"].append(a2)
-
-        # If S3 config didn't include weather/travel, fall back.
-        if not merged["agents"]:
-            return _json_response(event, 200, default_agents)
-
-        return _json_response(event, 200, merged)
-
+                    merged["agents"][1].update({k: v for k, v in a.items() if k in ("category", "label", "mode")})
     except Exception as e:
-        print(f"/agents fallback due to error: {e}")
-        return _json_response(event, 200, default_agents)
+        print(f"/agents overlay skipped due to error: {e}")
+
+    return _json_response(event, 200, merged)
 
 
 def _handle_post_agent_run(event: dict) -> dict:
@@ -666,7 +676,10 @@ def _handle_post_agent_run(event: dict) -> dict:
 
     if agent_id == AGENT_ID_WEATHER:
         if location not in allow_weather:
-            return _json_response(event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}})
+            return _json_response(
+                event, 400,
+                {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}}
+            )
 
         geo = geocode_location(location)
         if geo.get("lat") is None or geo.get("lon") is None:
@@ -697,13 +710,15 @@ def _handle_post_agent_run(event: dict) -> dict:
 def _handle_post_runbooks_ask(event: dict) -> dict:
     req = _get_body_json(event)
     question = (req.get("question") or "").strip()
-    top_k = int(req.get("top_k") or 5)
+
+    try:
+        top_k = int(req.get("top_k") or 5)
+    except Exception:
+        top_k = 5
+    top_k = max(1, min(top_k, 10))
 
     if not question:
         return _json_response(event, 400, {"error": {"code": "MISSING_QUESTION", "message": "question is required"}})
-
-    if top_k < 1 or top_k > 10:
-        top_k = 5
 
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
