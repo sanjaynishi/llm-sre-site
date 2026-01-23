@@ -16,6 +16,7 @@ env:
   TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
   # Domain-specific cert for dev.aimlsre.com (environment secret)
   TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
+  TF_VAR_lambda_image_uri: "dummy"
 
 jobs:
   deploy-dev:
@@ -54,20 +55,6 @@ jobs:
       # ---------- LAMBDA IMAGE (ECR) ----------
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repo exists
-        env:
-          AWS_REGION: "us-east-1"
-          IMAGE_REPO: "llm-sre-agent-api-dev"
-        run: |
-          set -euo pipefail
-          aws ecr describe-repositories \
-            --repository-names "$IMAGE_REPO" \
-            --region "$AWS_REGION" >/dev/null 2>&1 || \
-          aws ecr create-repository \
-            --repository-name "$IMAGE_REPO" \
-            --region "$AWS_REGION" >/dev/null
-          echo "ECR repo ok: $IMAGE_REPO"
 
       - name: Build and push Lambda image (agent_api)
         env:

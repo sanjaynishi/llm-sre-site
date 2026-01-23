@@ -1,0 +1,65 @@
+name: Import ECR Repo (DEV)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  import-ecr:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS creds (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-dev
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Terraform Init (DEV)
+        working-directory: infra/envs/dev
+        run: terraform init
+
+      - name: Import ECR repo into state
+        working-directory: infra/envs/dev
+        env:
+          TF_IN_AUTOMATION: "true"
+          TF_VAR_env: dev
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
+          TF_VAR_agent_config_bucket: llm-sre-agent-config-dev-830330555687
+          TF_VAR_agent_config_prefix: agent-config
+          TF_VAR_s3_prefix: knowledge/
+          TF_VAR_openai_model: gpt-5.2
+          # IMPORTANT: provide a dummy value so terraform doesn't prompt
+          TF_VAR_lambda_image_uri: "dummy"
+        run: |
+          set -euo pipefail
+          terraform import 'module.agent_api.aws_ecr_repository.agent_api' llm-sre-agent-api-dev
+
+      - name: Terraform Plan (sanity)
+        working-directory: infra/envs/dev
+        env:
+          TF_IN_AUTOMATION: "true"
+          TF_VAR_env: dev
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
+          TF_VAR_agent_config_bucket: llm-sre-agent-config-dev-830330555687
+          TF_VAR_agent_config_prefix: agent-config
+          TF_VAR_s3_prefix: knowledge/
+          TF_VAR_openai_model: gpt-5.2
+          TF_VAR_lambda_image_uri: "dummy"
+        run: terraform plan
