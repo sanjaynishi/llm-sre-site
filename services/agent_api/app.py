@@ -12,6 +12,7 @@ Notes:
 - /api/agents must only include location-based agents (weather/travel).
 - RAG is question-based; do NOT list it in /api/agents.
 - Chroma requires sqlite3 >= 3.35. Lambda base image sqlite is older, so we shim with pysqlite3-binary.
+- We also hard-disable Chroma telemetry to avoid runtime noise/errors.
 """
 
 from __future__ import annotations
@@ -27,17 +28,24 @@ import urllib.request
 from typing import Any, Dict, List, Tuple
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
+# In Lambda container we install pysqlite3-binary; this ensures chroma sees modern sqlite.
 try:
-    import pysqlite3.dbapi2 as sqlite3  # from pysqlite3-binary
+    import pysqlite3.dbapi2 as sqlite3  # type: ignore
     sys.modules["sqlite3"] = sqlite3
 except Exception:
     pass
+
+# ---- disable Chroma telemetry (prevents posthog/telemetry errors in Lambda logs) ----
+# These env vars are harmless if ignored by a given version.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("POSTHOG_DISABLED", "true")
 
 try:
     import boto3
 except Exception:
     boto3 = None
-
 
 # ---------------- Config ----------------
 
@@ -70,7 +78,7 @@ AGENT_ID_WEATHER = "agent-weather"
 AGENT_ID_TRAVEL = "agent-travel"
 
 _s3 = None
-_config_cache = {"agents": None, "allowlists": None}
+_config_cache: Dict[str, Any] = {"agents": None, "allowlists": None}
 
 _openai_client = None
 _chroma_client = None
@@ -100,7 +108,9 @@ def _json_response(event: dict, status_code: int, body: dict, extra_headers: dic
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": cors_origin,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
+        "Access-Control-Allow-Headers": (
+            "Content-Type,Authorization,X-Requested-With,X-Amz-Date,X-Api-Key,X-Amz-Security-Token"
+        ),
         "Vary": "Origin",
     }
     if extra_headers:
@@ -136,8 +146,15 @@ def _get_body_json(event: dict) -> dict:
 
 def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "llm-sre-agent/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:600] + "...") if len(detail) > 600 else detail
+        raise RuntimeError(f"HTTP {e.code} GET {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error GET {url} :: {e}") from e
 
 
 def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
@@ -146,8 +163,15 @@ def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeou
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:900] + "...") if len(detail) > 900 else detail
+        raise RuntimeError(f"HTTP {e.code} POST {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error POST {url} :: {e}") from e
 
 
 def _extract_json_object(text: str) -> str:
@@ -345,8 +369,10 @@ Return VALID JSON ONLY with this exact structure:
     # total sanity
     try:
         c = data.get("estimated_cost_usd", {})
-        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(
-            c.get("local_transport_food", 0)
+        parts = (
+            float(c.get("flights_for_2", 0))
+            + float(c.get("hotel_4_star_5_nights", 0))
+            + float(c.get("local_transport_food", 0))
         )
         c["total"] = round(parts, 0)
         data["estimated_cost_usd"] = c
@@ -422,6 +448,7 @@ def _ensure_chroma():
     if not VECTORS_PREFIX:
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
+    # Pull the persisted store from S3 into /tmp
     _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
 
     try:
@@ -432,9 +459,11 @@ def _ensure_chroma():
 
     _chroma_client = chromadb.PersistentClient(
         path=CHROMA_LOCAL_DIR,
-        settings=Settings(anonymized_telemetry=False),
+        settings=Settings(anonymized_telemetry=False, allow_reset=False),
     )
-    _chroma_collection = _chroma_client.get_collection(CHROMA_COLLECTION)
+
+    # get_or_create is safer across versions than get_collection (which throws if missing)
+    _chroma_collection = _chroma_client.get_or_create_collection(CHROMA_COLLECTION)
     _ = _chroma_collection.count()
     return _chroma_collection
 
@@ -448,7 +477,12 @@ def _embed_text(text: str) -> List[float]:
 def _retrieve_chunks(question: str, top_k: int) -> List[Dict[str, Any]]:
     col = _ensure_chroma()
     q_emb = _embed_text(question)
-    res = col.query(query_embeddings=[q_emb], n_results=top_k, include=["documents", "metadatas", "distances"])
+
+    res = col.query(
+        query_embeddings=[q_emb],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
 
     docs = (res.get("documents") or [[]])[0]
     metas = (res.get("metadatas") or [[]])[0]
@@ -458,6 +492,35 @@ def _retrieve_chunks(question: str, top_k: int) -> List[Dict[str, Any]]:
     for doc, meta, dist in zip(docs, metas, dists):
         out.append({"text": doc, "meta": meta, "distance": dist})
     return out
+
+
+def _response_text_from_openai_response(resp: Any) -> str:
+    """
+    Robust extraction across OpenAI SDK versions.
+    Prefer resp.output_text when available; otherwise walk resp.output message content.
+    """
+    try:
+        ot = getattr(resp, "output_text", None)
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
+    except Exception:
+        pass
+
+    text = ""
+    try:
+        output = getattr(resp, "output", None) or []
+        for item in output:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", None) or []:
+                    ctype = getattr(c, "type", None)
+                    if ctype in ("output_text", "text"):
+                        t = getattr(c, "text", None)
+                        if t:
+                            text += t
+    except Exception:
+        pass
+
+    return (text or "").strip()
 
 
 def _answer_with_llm(question: str, contexts: List[Dict[str, Any]]) -> str:
@@ -490,24 +553,22 @@ Excerpts:
 {context_block}
 """.strip()
 
-    resp = client.responses.create(model=OPENAI_MODEL, input=prompt, max_output_tokens=700)
+    resp = client.responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+        max_output_tokens=700,
+    )
 
-    out_text = ""
-    for item in (resp.output or []):
-        if getattr(item, "type", None) == "message":
-            for c in (item.content or []):
-                if getattr(c, "type", None) in ("output_text", "text"):
-                    out_text += c.text or ""
-    out_text = (out_text or "").strip() or (getattr(resp, "output_text", "") or "").strip()
+    out_text = _response_text_from_openai_response(resp)
     return out_text or "No answer returned."
 
 
 # ---------------- Handlers ----------------
 
 def _handle_get_health(event: dict) -> dict:
-    # show sqlite version to confirm shim in logs + response
+    # show sqlite version to confirm shim
     try:
-        import sqlite3 as _s
+        import sqlite3 as _s  # uses our shim if present
         sqlite_ver = getattr(_s, "sqlite_version", "unknown")
     except Exception:
         sqlite_ver = "unknown"
@@ -579,22 +640,38 @@ def _handle_post_agent_run(event: dict) -> dict:
 
     if agent_id == AGENT_ID_WEATHER:
         if location not in set(weather_locations):
-            return _json_response(event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}})
+            return _json_response(
+                event,
+                400,
+                {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}},
+            )
 
         geo = geocode_location(location)
         if geo.get("lat") is None or geo.get("lon") is None:
             return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
+        )
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
         if city not in set(travel_cities):
-            return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
+            return _json_response(
+                event,
+                400,
+                {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}},
+            )
 
         travel = get_travel_info(city)
-        return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
+        )
 
     return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
@@ -619,7 +696,11 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
             "question": question,
             "top_k": top_k,
             "sources": [
-                {"file": (c["meta"] or {}).get("file"), "s3_key": (c["meta"] or {}).get("s3_key"), "chunk": (c["meta"] or {}).get("chunk")}
+                {
+                    "file": (c.get("meta") or {}).get("file"),
+                    "s3_key": (c.get("meta") or {}).get("s3_key"),
+                    "chunk": (c.get("meta") or {}).get("chunk"),
+                }
                 for c in contexts
             ],
             "answer": answer,
