@@ -1,9 +1,11 @@
 # Keep numpy < 2 to avoid GCC>=9.3 build requirement in Lambda base image
-numpy==1.26.4
-
-openai>=2.0.0
+openai>=1.6.0
 boto3>=1.28.0
 botocore>=1.31.0
 
+# RAG deps
 chromadb==0.5.23
-pypdf>=3.17.0
+numpy==1.26.4
+pysqlite3-binary==0.5.3
+
+pypdf>=4.0.0
