@@ -13,8 +13,9 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_env: dev
   TF_VAR_aws_region: us-east-1
-  TF_VAR_acm_certificate_arn: ${{ secrets.TF_VAR_acm_certificate_arn_dev }}
   TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+  # Use the domain-specific secret to avoid mixups
+  TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
 
 jobs:
   deploy-dev:
@@ -60,18 +61,18 @@ jobs:
         working-directory: infra/envs/dev
         run: terraform init
 
-      - name: Terraform Apply (dev)
+      - name: Terraform Apply (DEV)
         working-directory: infra/envs/dev
         env:
           TF_VAR_agent_config_bucket: llm-sre-agent-config-dev-830330555687
           TF_VAR_agent_config_prefix: agent-config
           TF_VAR_s3_prefix: knowledge/
-          TF_VAR_env: dev
-          TF_VAR_aws_region: us-east-1
-          TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
           TF_VAR_openai_model: gpt-5.2
-          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV }}
-        run: terraform apply -auto-approve -input=false -lock-timeout=5m
+          # Keep cert here too (overrides job env if needed)
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
+        run: |
+          test -n "${TF_VAR_acm_certificate_arn}" || (echo "Missing TF_VAR_acm_certificate_arn" && exit 1)
+          terraform apply -auto-approve -input=false -lock-timeout=5m
 
       # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
       - name: Install jq
