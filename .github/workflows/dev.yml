@@ -55,6 +55,20 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Ensure ECR repo exists
+        env:
+          AWS_REGION: "us-east-1"
+          IMAGE_REPO: "llm-sre-agent-api-dev"
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories \
+            --repository-names "$IMAGE_REPO" \
+            --region "$AWS_REGION" >/dev/null 2>&1 || \
+          aws ecr create-repository \
+            --repository-name "$IMAGE_REPO" \
+            --region "$AWS_REGION" >/dev/null
+          echo "ECR repo ok: $IMAGE_REPO"
+
       - name: Build and push Lambda image (agent_api)
         env:
           AWS_ACCOUNT_ID: "830330555687"
@@ -71,6 +85,7 @@ jobs:
 
       - name: Verify IMAGE_URI is set
         run: |
+          set -euo pipefail
           test -n "${IMAGE_URI:-}" || (echo "::error::IMAGE_URI missing (ECR build/push step failed)" && exit 1)
           echo "IMAGE_URI=${IMAGE_URI}"
 
@@ -88,7 +103,6 @@ jobs:
           TF_VAR_s3_prefix: knowledge/
           TF_VAR_openai_model: gpt-5.2
           TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
-
           # Keep cert here too (overrides job env if needed)
           TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_DEV_AIMLSRE }}
         run: |
