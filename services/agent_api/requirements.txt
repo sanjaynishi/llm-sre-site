@@ -1,10 +1,9 @@
-openai>=1.6.0
-
-boto3>=1.28.0,<2.0
-botocore>=1.31.0,<2.0
-
-# IMPORTANT: avoid numpy 2.x source build (needs GCC >= 9.3)
+# Keep numpy < 2 to avoid GCC>=9.3 build requirement in Lambda base image
 numpy==1.26.4
 
-chromadb>=0.5.0,<0.6.0
+openai>=2.0.0
+boto3>=1.28.0
+botocore>=1.31.0
+
+chromadb==0.5.23
 pypdf>=3.17.0
