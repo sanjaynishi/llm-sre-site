@@ -1,20 +1,23 @@
 FROM public.ecr.aws/lambda/python:3.11
 
-# Optional but helpful for some wheels; you can keep if already present
-RUN yum -y update && \
-    yum -y install gcc gcc-c++ make cmake && \
-    yum clean all
-
 WORKDIR /var/task
 
 COPY requirements.txt .
 
-# Upgrade toolchain, install numpy first (binary wheel), then install the rest
+# Install deps
 RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install --no-cache-dir "numpy==1.26.4" && \
     python -m pip install --no-cache-dir -r requirements.txt
 
+# Prove sqlite shim works inside the built image (build-time safety check)
+RUN python - <<'PY'
+import sys
+import pysqlite3.dbapi2 as sqlite3
+sys.modules["sqlite3"] = sqlite3
+import sqlite3 as s
+print("sqlite_version:", s.sqlite_version)
+PY
+
 COPY app.py .
 
-# If your handler is app.lambda_handler
 CMD ["app.lambda_handler"]

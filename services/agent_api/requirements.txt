@@ -1,10 +1,16 @@
-# Keep numpy < 2 to avoid GCC>=9.3 build requirement in Lambda base image
-pysqlite3-binary>=0.5.2
+# --- Core ---
 openai>=1.6.0
 boto3>=1.28.0
 botocore>=1.31.0
 
-# RAG deps
+# --- SQLite shim for Chroma (Lambda base sqlite3 is too old) ---
+pysqlite3-binary>=0.5.2
+
+# --- RAG / Vector DB ---
 chromadb==0.5.23
+
+# Keep numpy < 2 to avoid build headaches
 numpy==1.26.4
+
+# Optional (only if you do PDF ingestion inside Lambda; for query-only not required)
 pypdf>=4.0.0
