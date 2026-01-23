@@ -1,5 +1,9 @@
 openai>=1.6.0
-boto3>=1.28.0
-botocore
-chromadb
-pypdf
+
+# Keep boto3/botocore compatible
+boto3>=1.28.0,<2.0
+botocore>=1.31.0,<2.0
+
+# RAG stack
+chromadb>=0.4.22,<0.6.0
+pypdf>=3.17.0

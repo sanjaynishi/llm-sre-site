@@ -67,7 +67,7 @@ jobs:
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}:${IMAGE_TAG}"
           echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
 
-          docker build -t "$IMAGE_URI" services/agent_api
+          docker build --progress=plain -t "$IMAGE_URI" services/agent_api
           docker push "$IMAGE_URI"
 
       - name: Verify IMAGE_URI is set

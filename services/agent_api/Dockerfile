@@ -1,16 +1,18 @@
 FROM public.ecr.aws/lambda/python:3.11
 
-# Set workdir
+# Tooling for packages that may need compilation
+RUN yum -y update && \
+    yum -y install gcc gcc-c++ make cmake && \
+    yum clean all
+
 WORKDIR /var/task
 
-# ---- Install Python dependencies ----
-# Copy requirements first for layer caching
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir -r requirements.txt
+# Upgrade pip toolchain + verbose output so the real failing package is visible
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir -v -r requirements.txt
 
-# ---- Copy app code ----
 COPY app.py .
 
-# Lambda handler
 CMD ["app.lambda_handler"]
