@@ -11,6 +11,13 @@ Endpoints (behind CloudFront /api/*):
 Key UI rule:
 - /api/agents MUST ONLY include agents that use /api/agent/run (location dropdown flow).
   RAG agent is question-based, so keep it OUT of /api/agents.
+
+Important deployment note:
+- This file is safe even if 'openai' or 'chromadb' are NOT installed.
+  - Weather will still work.
+  - /api/agents will still work (never throws).
+  - Travel will return a clear error if openai is missing.
+  - RAG will return a clear error if openai/chromadb are missing.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Tuple, List, Dict
+
 
 try:
     import boto3
@@ -53,22 +61,27 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
 
 CHROMA_LOCAL_DIR = "/tmp/chroma_store"
 
-DEFAULT_ALLOWED_LOCATIONS = sorted([
-    "New York, NY",
-    "San Francisco, CA",
-    "Seattle, WA",
-    "London, UK",
-    "Delhi, India",
-    "Tokyo, Japan",
-])
+DEFAULT_ALLOWED_LOCATIONS = sorted(
+    [
+        "New York, NY",
+        "San Francisco, CA",
+        "Seattle, WA",
+        "London, UK",
+        "Delhi, India",
+        "Tokyo, Japan",
+    ]
+)
 
-DEFAULT_TRAVEL_CITIES = sorted([
-    "Paris",
-    "London",
-    "New York",
-    "Tokyo",
-    "Rome",
-])
+DEFAULT_TRAVEL_CITIES = sorted(
+    [
+        "Paris",
+        "London",
+        "New York",
+        "Tokyo",
+        "Rome",
+        "Delhi",  # keep if your UI previously had it
+    ]
+)
 
 AGENT_ID_WEATHER = "agent-weather"
 AGENT_ID_TRAVEL = "agent-travel"
@@ -77,7 +90,7 @@ AGENT_ID_TRAVEL = "agent-travel"
 _s3 = None
 _config_cache = {"agents": None, "allowlists": None}
 
-# Warm caches for RAG (initialized lazily)
+# Warm caches for LLM/RAG (initialized lazily)
 _openai_client = None
 _chroma_client = None
 _chroma_collection = None
@@ -123,7 +136,9 @@ def _get_method(event: dict) -> str:
 
 
 def _get_path(event: dict) -> str:
+    # HTTP API v2: rawPath; REST: path
     path = event.get("rawPath") or event.get("path") or "/"
+    # CloudFront behavior routes /api/* to API GW; normalize
     if path.startswith("/api/"):
         path = path[4:]  # remove "/api"
     return path
@@ -214,6 +229,35 @@ def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
         raise RuntimeError(f"Network error calling upstream: {url} :: {e}") from e
 
 
+def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json", "User-Agent": "llm-sre-agent/1.0"}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:800] + "...") if len(detail) > 800 else detail
+        raise RuntimeError(f"HTTP {e.code} POST {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error POST {url} :: {e}") from e
+
+
+def _extract_json_object(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return text
+    return text[start : end + 1]
+
+
 # ---------------- Weather (Open-Meteo) ----------------
 
 def geocode_location(location: str) -> dict:
@@ -283,22 +327,47 @@ def fetch_weather(lat: float, lon: float) -> dict:
     return _http_get_json(url)
 
 
-# ---------------- Lazy OpenAI + Chroma (only used for Travel + RAG) ----------------
+# ---------------- Lazy OpenAI (SDK) + RAG ----------------
 
 def _ensure_openai():
+    """
+    Lazy-import OpenAI SDK so the Lambda can still run /health, /agents, Weather even if openai isn't installed.
+    """
     global _openai_client
-    if _openai_client is None:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not configured")
-        # lazy import
-        from openai import OpenAI  # noqa
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    if _openai_client is not None:
+        return _openai_client
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"OpenAI SDK not installed (pip install openai). Import error: {e}") from e
+
+    _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
 
-def get_travel_info(city: str) -> dict:
-    client = _ensure_openai()
+def _openai_call_travel(prompt: str) -> dict:
+    """
+    Uses OpenAI Responses API via stdlib HTTP, so Travel works even without the openai SDK.
+    This also avoids SDK import issues in zip-based Lambdas.
+    """
+    if not OPENAI_API_KEY:
+        return {"error": {"message": "OPENAI_API_KEY not configured"}}
 
+    url = "https://api.openai.com/v1/responses"
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        "max_output_tokens": 650,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    return _http_post_json(url, payload, headers=headers, timeout_sec=25)
+
+
+def get_travel_info(city: str) -> dict:
     prompt = f"""
 You are a travel planning assistant.
 
@@ -329,34 +398,29 @@ Rules:
 - No markdown; JSON only
 """.strip()
 
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=prompt,
-        max_output_tokens=650,
-    )
+    resp = _openai_call_travel(prompt)
+    if isinstance(resp, dict) and resp.get("error"):
+        return {"error": resp.get("error")}
 
-    out_text = ""
-    for item in resp.output or []:
-        if getattr(item, "type", None) == "message":
-            for c in item.content or []:
-                if getattr(c, "type", None) in ("output_text", "text"):
-                    out_text += c.text or ""
-    out_text = (out_text or "").strip() or (getattr(resp, "output_text", "") or "").strip()
+    # Extract output text from Responses API
+    output_text = ""
+    for item in resp.get("output", []) or []:
+        if item.get("type") == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") in ("output_text", "text"):
+                    output_text += c.get("text", "")
 
-    if not out_text:
-        return {"error": "OpenAI returned empty output"}
+    output_text = (output_text or "").strip() or (resp.get("output_text") or "").strip()
+    if not output_text:
+        return {"error": {"message": "OpenAI returned empty output"}}
 
+    candidate = _extract_json_object(output_text)
     try:
-        data = json.loads(out_text)
+        data = json.loads(candidate)
     except Exception:
-        start = out_text.find("{")
-        end = out_text.rfind("}")
-        candidate = out_text[start:end + 1] if start != -1 and end != -1 and end > start else out_text
-        try:
-            data = json.loads(candidate)
-        except Exception:
-            return {"error": "Failed to parse JSON from model", "raw_output": out_text[:1200]}
+        return {"error": {"message": "Failed to parse JSON from model", "raw_output": output_text[:1200]}}
 
+    # Sanity-check total
     try:
         c = data.get("estimated_cost_usd", {})
         parts = (
@@ -371,6 +435,8 @@ Rules:
 
     return data
 
+
+# ---------------- S3 download folder (RAG) ----------------
 
 def _s3_list_keys(bucket: str, prefix: str) -> List[str]:
     s3 = _s3_client()
@@ -412,7 +478,13 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     return count
 
 
+# ---------------- Chroma init/query (lazy) ----------------
+
 def _ensure_chroma():
+    """
+    Lazy import of chromadb.
+    If chromadb isn't installed, only /runbooks/ask will fail, not the whole Lambda.
+    """
     global _chroma_client, _chroma_collection
     if _chroma_collection is not None:
         return _chroma_collection
@@ -424,9 +496,11 @@ def _ensure_chroma():
 
     _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
 
-    # lazy import
-    import chromadb  # noqa
-    from chromadb.config import Settings  # noqa
+    try:
+        import chromadb  # type: ignore
+        from chromadb.config import Settings  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"chromadb not installed in this Lambda image. Import error: {e}") from e
 
     _chroma_client = chromadb.PersistentClient(
         path=CHROMA_LOCAL_DIR,
@@ -520,6 +594,7 @@ def _handle_get_agents(event: dict) -> dict:
     """
     Always return Weather + Travel agents with allowed_locations.
     Never throw (UI depends on this).
+    IMPORTANT: Do NOT include RAG agent here.
     """
     default_agents = {
         "agents": [
@@ -546,8 +621,8 @@ def _handle_get_agents(event: dict) -> dict:
 
         merged = {"agents": []}
 
-        # If agents.json exists, we merge labels/categories/modes from there,
-        # but we ALWAYS enforce allowed_locations for weather/travel.
+        # If agents.json exists, merge labels/categories/modes from there,
+        # but ALWAYS enforce allowed_locations for weather/travel.
         if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
             for a in agents_cfg["agents"]:
                 if not isinstance(a, dict) or not a.get("id"):
@@ -598,7 +673,11 @@ def _handle_post_agent_run(event: dict) -> dict:
             return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
+        )
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
@@ -606,7 +685,11 @@ def _handle_post_agent_run(event: dict) -> dict:
             return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
 
         travel = get_travel_info(city)
-        return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
+        )
 
     return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
@@ -625,19 +708,23 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
 
-    return _json_response(event, 200, {
-        "question": question,
-        "top_k": top_k,
-        "sources": [
-            {
-                "file": (c["meta"] or {}).get("file"),
-                "s3_key": (c["meta"] or {}).get("s3_key"),
-                "chunk": (c["meta"] or {}).get("chunk"),
-            }
-            for c in contexts
-        ],
-        "answer": answer
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "question": question,
+            "top_k": top_k,
+            "sources": [
+                {
+                    "file": (c["meta"] or {}).get("file"),
+                    "s3_key": (c["meta"] or {}).get("s3_key"),
+                    "chunk": (c["meta"] or {}).get("chunk"),
+                }
+                for c in contexts
+            ],
+            "answer": answer,
+        },
+    )
 
 
 # ---------------- Lambda entry ----------------
@@ -660,24 +747,28 @@ def lambda_handler(event: dict, context: Any) -> dict:
             return _handle_get_agents(event)
         except Exception as e:
             print(f"/agents hard-fallback due to unexpected error: {e}")
-            return _json_response(event, 200, {
-                "agents": [
-                    {
-                        "id": AGENT_ID_WEATHER,
-                        "category": "Weather",
-                        "label": "Weather information (full details)",
-                        "mode": "tool_weather",
-                        "allowed_locations": DEFAULT_ALLOWED_LOCATIONS,
-                    },
-                    {
-                        "id": AGENT_ID_TRAVEL,
-                        "category": "Travel",
-                        "label": "Travel planner (AI-powered)",
-                        "mode": "tool_travel",
-                        "allowed_locations": DEFAULT_TRAVEL_CITIES,
-                    },
-                ]
-            })
+            return _json_response(
+                event,
+                200,
+                {
+                    "agents": [
+                        {
+                            "id": AGENT_ID_WEATHER,
+                            "category": "Weather",
+                            "label": "Weather information (full details)",
+                            "mode": "tool_weather",
+                            "allowed_locations": DEFAULT_ALLOWED_LOCATIONS,
+                        },
+                        {
+                            "id": AGENT_ID_TRAVEL,
+                            "category": "Travel",
+                            "label": "Travel planner (AI-powered)",
+                            "mode": "tool_travel",
+                            "allowed_locations": DEFAULT_TRAVEL_CITIES,
+                        },
+                    ]
+                },
+            )
 
     # Agent run (location-based)
     if method == "POST" and (path == "/agent/run" or path.endswith("/agent/run")):

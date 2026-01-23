@@ -1,5 +1,5 @@
 openai>=1.6.0
-boto3
+boto3>=1.28.0
 botocore
 chromadb
 pypdf
