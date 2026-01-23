@@ -209,10 +209,24 @@ resource "aws_cloudfront_distribution" "cdn" {
     geo_restriction { restriction_type = "none" }
   }
 
-  viewer_certificate {
-    acm_certificate_arn      = var.acm_certificate_arn
-    ssl_support_method       = "sni-only"
-    minimum_protocol_version = "TLSv1.2_2021"
+  # Viewer certificate must be conditional:
+  # - If ACM cert is provided -> set ssl_support_method + minimum_protocol_version
+  # - Else -> use CloudFront default certificate
+  dynamic "viewer_certificate" {
+    for_each = (var.acm_certificate_arn != null && var.acm_certificate_arn != "") ? [1] : []
+    content {
+      acm_certificate_arn            = var.acm_certificate_arn
+      ssl_support_method             = "sni-only"
+      minimum_protocol_version       = "TLSv1.2_2021"
+      cloudfront_default_certificate = false
+    }
+  }
+
+  dynamic "viewer_certificate" {
+    for_each = (var.acm_certificate_arn == null || var.acm_certificate_arn == "") ? [1] : []
+    content {
+      cloudfront_default_certificate = true
+    }
   }
 }
 
