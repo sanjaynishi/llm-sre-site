@@ -55,7 +55,7 @@ jobs:
 
       - name: Terraform Apply (PROD)
         working-directory: infra/envs/prod
-        run: terraform apply -auto-approve -input=false
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m -var-file=terraform.tfvars
 
       - name: Read Terraform outputs (PROD)
         id: tfout

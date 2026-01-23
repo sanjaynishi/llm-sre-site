@@ -62,7 +62,7 @@ jobs:
 
       - name: Terraform Apply (DEV)
         working-directory: infra/envs/dev
-        run: terraform apply -auto-approve -input=false -lock-timeout=5m
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m -var-file=terraform.tfvars
 
       # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
       - name: Install jq
