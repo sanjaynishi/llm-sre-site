@@ -1,11 +1,16 @@
 FROM public.ecr.aws/lambda/python:3.11
 
-# Copy and install dependencies
+# Set workdir
+WORKDIR /var/task
+
+# ---- Install Python dependencies ----
+# Copy requirements first for layer caching
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY app.py ${LAMBDA_TASK_ROOT}/
+# ---- Copy app code ----
+COPY app.py .
 
 # Lambda handler
 CMD ["app.lambda_handler"]
