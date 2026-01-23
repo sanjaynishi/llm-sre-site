@@ -6,6 +6,12 @@ Endpoints (behind CloudFront /api/*):
   POST /api/agent/run     -> runs a selected agent:
        - agent-weather (Open-Meteo)
        - agent-travel  (OpenAI over HTTPS, no SDK required)
+  GET  /api/health        -> health + config echo (safe)
+  GET  /api/runbooks      -> list runbook PDFs from S3 (knowledge/runbooks/)
+  GET  /api/doc?name=...  -> fetch runbook by filename:
+                             - if .pdf -> returns presigned URL
+                             - else   -> returns content decoded as text
+  GET  /api/doc?key=...   -> fetch by full S3 key (same behavior as above)
   OPTIONS *               -> CORS preflight
 """
 
@@ -64,11 +70,17 @@ OPENAI_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get("OPENAI_FALLBACK_MODELS", "").split(",") if m.strip()
 ]
 
+# Config JSON (dropdowns / allowlists)
 AGENT_CONFIG_BUCKET = os.environ.get("AGENT_CONFIG_BUCKET", "").strip()
 AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").strip()
 
+# Runbooks / docs (knowledge base)
+S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
+S3_PREFIX = os.environ.get("S3_PREFIX", "knowledge/").strip()
+RUNBOOKS_PREFIX = os.environ.get("RUNBOOKS_PREFIX", "runbooks/").strip()
 
-# --- S3 helpers (config) ------------------------------------------------------
+
+# --- S3 helpers ---------------------------------------------------------------
 
 _s3 = None
 _config_cache = {"agents": None, "allowlists": None}
@@ -86,10 +98,63 @@ def _s3_client():
 def _s3_get_json(bucket: str, key: str) -> dict:
     try:
         resp = _s3_client().get_object(Bucket=bucket, Key=key)
-        raw = resp["Body"].read().decode("utf-8")
+        raw = resp["Body"].read().decode("utf-8", errors="replace")
         return json.loads(raw)
     except ClientError as e:
         raise RuntimeError(f"S3 get_object failed for s3://{bucket}/{key}: {e}") from e
+
+
+def _s3_get_text(bucket: str, key: str) -> str:
+    """
+    Decodes bytes as UTF-8 text. Use only for text-based documents.
+    PDFs should be delivered via presigned URL (see _handle_get_doc).
+    """
+    try:
+        resp = _s3_client().get_object(Bucket=bucket, Key=key)
+        return resp["Body"].read().decode("utf-8", errors="replace")
+    except ClientError as e:
+        raise RuntimeError(f"S3 get_object failed for s3://{bucket}/{key}: {e}") from e
+
+
+def _s3_key(prefix: str, path: str) -> str:
+    if not prefix:
+        return path.lstrip("/")
+    return f"{prefix.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _s3_list(bucket: str, prefix: str) -> list[dict]:
+    """
+    Paginates list_objects_v2 (future-proof; returns all keys under prefix).
+    """
+    s3 = _s3_client()
+    out: list[dict] = []
+    token = None
+
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+
+        resp = s3.list_objects_v2(**kwargs)
+        out.extend(resp.get("Contents") or [])
+
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+
+    return out
+
+
+def _presign_get_url(bucket: str, key: str, expires_sec: int = 900) -> str:
+    """
+    Presigned URL for secure client-side download/view.
+    Default expiry: 15 minutes.
+    """
+    return _s3_client().generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_sec,
+    )
 
 
 def _load_agent_config() -> Tuple[dict, dict]:
@@ -173,7 +238,7 @@ def _json_response(event: dict, status_code: int, body: dict, extra_headers: dic
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": cors_origin,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
         "Vary": "Origin",
     }
     if extra_headers:
@@ -379,7 +444,6 @@ Rules:
 - No markdown; JSON only
 """.strip()
 
-    # Try primary model, then fallback models if model_not_found happens.
     models_to_try = [OPENAI_MODEL] + [m for m in OPENAI_FALLBACK_MODELS if m != OPENAI_MODEL]
 
     last_err = None
@@ -392,26 +456,22 @@ Rules:
             last_err = f"OpenAI call failed (model={m}): {e}"
             continue
 
-        # OpenAI error payloads are usually like: {"error": {...}}
         if isinstance(resp, dict) and resp.get("error"):
             err_obj = resp.get("error") or {}
             code = err_obj.get("code") or ""
             msg = err_obj.get("message") or str(err_obj)
             last_err = f"OpenAI API error (model={m}): {code} {msg}"
 
-            # Retry only if model not found
             if code == "model_not_found" or "does not exist" in str(msg).lower():
                 continue
 
             return {"error": last_err}
 
-        # Success
         break
 
     if not isinstance(resp, dict) or resp.get("error"):
         return {"error": last_err or "OpenAI call failed"}
 
-    # Extract output text
     output_text = ""
     for item in resp.get("output", []) or []:
         if item.get("type") == "message":
@@ -429,7 +489,6 @@ Rules:
     except json.JSONDecodeError:
         return {"error": "Failed to parse JSON from model", "raw_output": output_text[:1200]}
 
-    # Sanity-check total
     try:
         c = data.get("estimated_cost_usd", {})
         parts = (
@@ -447,8 +506,79 @@ Rules:
 
 # --- API Routes ---------------------------------------------------------------
 
+def _handle_get_health(event: dict) -> dict:
+    return _json_response(
+        event,
+        200,
+        {
+            "status": "ok",
+            "agent_config_bucket": AGENT_CONFIG_BUCKET,
+            "agent_config_prefix": AGENT_CONFIG_PREFIX,
+            "s3_bucket": S3_BUCKET,
+            "s3_prefix": S3_PREFIX,
+            "runbooks_prefix": RUNBOOKS_PREFIX,
+        },
+    )
+
+
+def _handle_get_runbooks(event: dict) -> dict:
+    if not S3_BUCKET:
+        return _json_response(event, 500, {"error": {"code": "S3_BUCKET_NOT_SET", "message": "S3_BUCKET not configured"}})
+
+    prefix = _s3_key(S3_PREFIX, RUNBOOKS_PREFIX)  # e.g. knowledge/runbooks/
+    objs = _s3_list(S3_BUCKET, prefix)
+
+    runbooks = []
+    for o in objs:
+        k = o.get("Key", "")
+        if k.lower().endswith(".pdf"):
+            runbooks.append(
+                {
+                    "name": k.split("/")[-1],
+                    "key": k,
+                    "size": o.get("Size", 0),
+                    "last_modified": o.get("LastModified").isoformat() if o.get("LastModified") else None,
+                }
+            )
+
+    runbooks.sort(key=lambda x: (x["name"] or "").lower())
+    return _json_response(event, 200, {"bucket": S3_BUCKET, "prefix": prefix, "runbooks": runbooks})
+
+
+def _handle_get_doc(event: dict) -> dict:
+    qs = event.get("queryStringParameters") or {}
+    key = (qs.get("key") or "").strip()
+    name = (qs.get("name") or "").strip()
+
+    if not S3_BUCKET:
+        return _json_response(event, 500, {"error": {"code": "S3_BUCKET_NOT_SET", "message": "S3_BUCKET not configured"}})
+
+    # Resolve key from name if needed
+    if not key and name:
+        prefix = _s3_key(S3_PREFIX, RUNBOOKS_PREFIX)
+        objs = _s3_list(S3_BUCKET, prefix)
+        for o in objs:
+            k = o.get("Key", "")
+            if k.split("/")[-1] == name:
+                key = k
+                break
+        if not key:
+            return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Runbook not found: {name}"}})
+
+    if not key:
+        return _json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": "Use ?name=<file.pdf> or ?key=<s3-key>"}})
+
+    # PDFs: return presigned URL instead of unreadable decoded bytes
+    if key.lower().endswith(".pdf"):
+        url = _presign_get_url(S3_BUCKET, key, expires_sec=900)
+        return _json_response(event, 200, {"key": key, "url": url, "expires_in": 900})
+
+    # Text-ish docs: return decoded content
+    content = _s3_get_text(S3_BUCKET, key)
+    return _json_response(event, 200, {"key": key, "content": content})
+
+
 def _handle_get_agents(event: dict) -> dict:
-    # fallback catalog if S3 is missing/unreadable
     default_agents = {
         "agents": [
             {
@@ -472,7 +602,6 @@ def _handle_get_agents(event: dict) -> dict:
         agents_cfg, _ = _load_agent_config()
         weather_locations, travel_cities = _effective_allowlists()
 
-        # agents.json structure: { "agents": [ {id,category,label,mode}, ... ] }
         if isinstance(agents_cfg, dict) and isinstance(agents_cfg.get("agents"), list):
             merged = {"agents": []}
             for a in agents_cfg["agents"]:
@@ -537,6 +666,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     if method == "OPTIONS":
         return _json_response(event, 200, {"ok": True})
+
+    if method == "GET" and path.endswith("/health"):
+        return _handle_get_health(event)
+
+    if method == "GET" and path.endswith("/runbooks"):
+        return _handle_get_runbooks(event)
+
+    if method == "GET" and path.endswith("/doc"):
+        return _handle_get_doc(event)
 
     if method == "GET" and path.endswith("/agents"):
         return _handle_get_agents(event)
