@@ -56,3 +56,8 @@ variable "s3_prefix" {
   description = "Prefix under the bucket for docs/runbooks (e.g., knowledge/)"
   default     = "knowledge/"
 }
+
+variable "lambda_image_uri" {
+  type        = string
+  description = "ECR image URI for the agent_api Lambda container"
+}

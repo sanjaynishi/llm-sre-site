@@ -9,3 +9,7 @@ output "http_api_id" {
 output "lambda_name" {
   value = aws_lambda_function.agent_api.function_name
 }
+
+output "ecr_repository_url" {
+  value = aws_ecr_repository.agent_api.repository_url
+}

@@ -123,9 +123,35 @@ resource "aws_lambda_function" "agent_api" {
       S3_PREFIX       = var.s3_prefix          # e.g. "knowledge/"
       RUNBOOKS_PREFIX = "runbooks/"            # resolves to "knowledge/runbooks/"
       AGENTS_KEY      = "agents.json"
+
+      VECTORS_PREFIX    = "knowledge/vectors/dev/chroma/"
+      CHROMA_COLLECTION = "runbooks_dev"
+      EMBED_MODEL       = "text-embedding-3-small"
     }
   }
 }
+
+resource "aws_ecr_repository" "agent_api" {
+  name = "${local.lambda_name}"
+  image_scanning_configuration { scan_on_push = true }
+}
+
+resource "aws_ecr_lifecycle_policy" "agent_api" {
+  repository = aws_ecr_repository.agent_api.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 20 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 20
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+
 
 # HTTP API (API Gateway v2)
 resource "aws_apigatewayv2_api" "http_api" {
@@ -214,4 +240,10 @@ resource "aws_lambda_permission" "allow_apigw" {
   function_name = aws_lambda_function.agent_api.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+}
+
+resource "aws_apigatewayv2_route" "runbooks_ask" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "POST /api/runbooks/ask"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
 }

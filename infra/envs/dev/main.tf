@@ -25,6 +25,8 @@ module "agent_api" {
   # Lambda source code directory
   lambda_src_dir = "${path.module}/../../../services/agent_api"
 
+  lambda_image_uri = var.lambda_image_uri
+
   # ✅ Use EXISTING bucket (same bucket you upload JSON + runbooks to)
   agent_config_bucket = var.agent_config_bucket
 

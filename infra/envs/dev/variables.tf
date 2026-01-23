@@ -31,3 +31,7 @@ variable "agent_config_prefix" {
   type        = string
   description = "Prefix under the bucket (example: knowledge/)"
 }
+
+variable "lambda_image_uri" {
+  type = string
+}
