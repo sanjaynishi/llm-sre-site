@@ -3,12 +3,15 @@ import os
 import boto3
 from botocore.exceptions import ClientError
 
+import sys
+
+# --- sqlite shim for Chroma (Lambda has old sqlite3) ---
 try:
-    import pysqlite3
-    import sys
+    import pysqlite3  # from pysqlite3-binary
     sys.modules["sqlite3"] = pysqlite3
-except Exception as e:
-    print(f"pysqlite3 not available: {e}")
+except Exception as _e:
+    # If this fails, Chroma may fail later with sqlite version error
+    pass
 
 s3 = boto3.client("s3")
 
