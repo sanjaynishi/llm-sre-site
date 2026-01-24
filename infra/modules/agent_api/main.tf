@@ -5,7 +5,7 @@
 # - Defines local.ecr_repo_name
 # - Safe defaults for prefixes/collection
 # - Optional ECR management (manage_ecr=true|false)
-# - prevent_destroy on ECR repo so CI never tries to delete a non-empty repo
+# - ECR repo protected from deletion (force_delete=false + prevent_destroy=true)
 # - Guard against empty image_uri (clear error early)
 # - One catch-all route (ANY /api/{proxy+}) since app routes internally
 
@@ -84,7 +84,9 @@ resource "aws_ecr_repository" "agent_api" {
     scan_on_push = true
   }
 
-  # ✅ Critical: never let Terraform delete the repo (prevents "RepositoryNotEmptyException")
+  # ✅ Important: never delete the repo (avoids RepositoryNotEmptyException)
+  force_delete = false
+
   lifecycle {
     prevent_destroy = true
   }

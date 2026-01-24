@@ -29,7 +29,7 @@ module "agent_api" {
   lambda_image_uri = var.lambda_image_uri
 
   # ✅ Keep Terraform managing ECR in DEV so it never tries to delete it
-  manage_ecr = true
+  manage_ecr = false
 
   # ✅ Use EXISTING bucket (same bucket you upload JSON + runbooks to)
   agent_config_bucket = var.agent_config_bucket

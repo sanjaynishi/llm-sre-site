@@ -35,3 +35,8 @@ variable "agent_config_prefix" {
 variable "lambda_image_uri" {
   type = string
 }
+
+variable "manage_ecr" {
+  type    = bool
+  default = false
+}
