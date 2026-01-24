@@ -14,7 +14,6 @@ env:
   TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
   # Prod cert must include aimlsre.com + www.aimlsre.com
   TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_PROD_AIMLSRE }}
-  TF_VAR_lambda_image_uri: "dummy"
 
 jobs:
   deploy-prod:
@@ -64,7 +63,7 @@ jobs:
           set -euo pipefail
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}:${IMAGE_TAG}"
           echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-
+          echo "Building/pushing: $IMAGE_URI"
           docker build --progress=plain -t "$IMAGE_URI" services/agent_api
           docker push "$IMAGE_URI"
 
@@ -88,16 +87,10 @@ jobs:
           TF_VAR_s3_prefix: knowledge/
           TF_VAR_openai_model: gpt-5.2
           TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
-          TF_VAR_vectors_prefix: knowledge/vectors/prod/chroma/
-          TF_VAR_runbooks_prefix: runbooks/
-          TF_VAR_domain_name: aimlsre.com
-          TF_VAR_www_domain: www.aimlsre.com
-          # Keep cert here too (overrides job env if needed)
-          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_PROD_AIMLSRE }}
         run: |
           set -euo pipefail
-          test -n "${TF_VAR_acm_certificate_arn}" || (echo "Missing TF_VAR_acm_certificate_arn" && exit 1)
-          test -n "${TF_VAR_lambda_image_uri}" || (echo "Missing TF_VAR_lambda_image_uri" && exit 1)
+          test -n "${TF_VAR_acm_certificate_arn}" || (echo "::error::Missing TF_VAR_acm_certificate_arn" && exit 1)
+          test -n "${TF_VAR_lambda_image_uri}" || (echo "::error::Missing TF_VAR_lambda_image_uri" && exit 1)
           terraform init -input=false
           terraform apply -auto-approve -input=false -lock-timeout=5m
 
@@ -115,13 +108,14 @@ jobs:
           DOMAIN_WWW="www.aimlsre.com"
           TFOUT_JSON="$(terraform output -json)"
 
-          # Prefer root domain bucket mapping; fallback to www if needed
-          S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_ROOT" '.s3_buckets.value[$d]')"
+          # ✅ FIX: site module now outputs ui_s3_buckets (not s3_buckets)
+          S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_ROOT" '.ui_s3_buckets.value[$d]')"
           if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
-            S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_WWW" '.s3_buckets.value[$d]')"
+            S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_WWW" '.ui_s3_buckets.value[$d]')"
           fi
+
           if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
-            echo "::error::Could not read S3 bucket from terraform output for $DOMAIN_ROOT or $DOMAIN_WWW"
+            echo "::error::Could not read S3 bucket from terraform output (ui_s3_buckets) for $DOMAIN_ROOT or $DOMAIN_WWW"
             echo "$TFOUT_JSON" | jq .
             exit 1
           fi
