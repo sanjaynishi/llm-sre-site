@@ -113,3 +113,7 @@ variable "ui_bucket_name" {
   type        = string
   default     = ""
 }
+
+variable "analytics_bucket_domain_name" {
+  type = string
+}

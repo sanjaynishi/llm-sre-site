@@ -1,5 +1,3 @@
-# infra/envs/prod/main.tf
-
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
@@ -13,6 +11,9 @@ terraform {
 provider "aws" {
   region = var.aws_region
 }
+
+# ✅ Needed because site module now requires aws_account_id
+data "aws_caller_identity" "current" {}
 
 # ============================================================
 # Agent API (Site depends on API endpoint for /api/* origin)
@@ -35,7 +36,7 @@ module "agent_api" {
   lambda_src_dir   = "${path.module}/../../../services/agent_api"
   lambda_image_uri = var.lambda_image_uri
 
-  # IMPORTANT: avoid Terraform touching ECR if your IAM user lacks ECR write perms
+  # ECR not managed by TF in dev/prod (CI builds/pushes images)
   manage_ecr = false
 
   # Config / knowledge bucket + prefixes
@@ -43,11 +44,11 @@ module "agent_api" {
   agent_config_prefix = var.agent_config_prefix
 
   # Knowledge layout
-  s3_prefix        = var.s3_prefix
-  runbooks_prefix  = var.runbooks_prefix
-  vectors_prefix   = var.vectors_prefix
+  s3_prefix         = var.s3_prefix
+  runbooks_prefix   = var.runbooks_prefix
+  vectors_prefix    = var.vectors_prefix
   chroma_collection = var.chroma_collection
-  embed_model      = var.embed_model
+  embed_model       = var.embed_model
 
   # Optional
   agents_key = "agents.json"
@@ -62,7 +63,7 @@ module "agent_api" {
 
 # ============================================================
 # Site (CloudFront + S3)
-# One distribution per domain in var.domains (map required by module)
+# One distribution per domain in var.domains
 # ============================================================
 module "site" {
   source              = "../../modules/site"
@@ -72,9 +73,16 @@ module "site" {
 
   enable_placeholder = false
 
+  # ✅ REQUIRED by site module
+  name_prefix    = var.name_prefix
+  aws_account_id = data.aws_caller_identity.current.account_id
+
   # API GW hostname for CloudFront origin (no scheme, no trailing slash)
   api_domain_name = replace(replace(module.agent_api.http_api_endpoint, "https://", ""), "/", "")
 
   # module.site expects map(string)
   domains = { for d in var.domains : d => d }
+
+  # ✅ Optional (safe). Only works if you added this variable + analytics module.
+  analytics_bucket_domain_name = try(var.analytics_bucket_domain_name, "")
 }

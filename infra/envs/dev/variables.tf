@@ -40,3 +40,15 @@ variable "manage_ecr" {
   type    = bool
   default = false
 }
+
+variable "name_prefix" {
+  description = "Base name prefix for resources (e.g., llm-sre)"
+  type        = string
+  default     = "llm-sre"
+}
+
+variable "analytics_bucket_domain_name" {
+  description = "S3 bucket domain name for CloudFront access logs (optional in dev)"
+  type        = string
+  default     = ""
+}

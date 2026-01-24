@@ -11,6 +11,9 @@ provider "aws" {
   region = var.aws_region
 }
 
+# ✅ Needed because site module now requires aws_account_id
+data "aws_caller_identity" "current" {}
+
 # --- Agent API first (site depends on its endpoint) ---
 module "agent_api" {
   source = "../../modules/agent_api"
@@ -28,7 +31,7 @@ module "agent_api" {
   # MUST be non-empty in CI (set by GitHub Actions)
   lambda_image_uri = var.lambda_image_uri
 
-  # ✅ Keep Terraform managing ECR in DEV so it never tries to delete it
+  # ECR not managed by TF in dev/prod (CI builds/pushes images)
   manage_ecr = false
 
   # ✅ Use EXISTING bucket (same bucket you upload JSON + runbooks to)
@@ -50,10 +53,18 @@ module "site" {
 
   enable_placeholder = false
 
+  # ✅ REQUIRED by site module
+  name_prefix    = var.name_prefix
+  aws_account_id = data.aws_caller_identity.current.account_id
+
   # Convert endpoint to host string expected by site module
   api_domain_name = replace(replace(module.agent_api.http_api_endpoint, "https://", ""), "/", "")
 
   domains = {
     "dev.aimlsre.com" = "dev.aimlsre.com"
   }
+
+  # ✅ Optional (safe). Only works if you added this variable + analytics module.
+  # If var.analytics_bucket_domain_name isn't defined yet, try() prevents a hard failure.
+  analytics_bucket_domain_name = try(var.analytics_bucket_domain_name, "")
 }
