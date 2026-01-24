@@ -1,59 +1,193 @@
 import React, { useMemo, useState } from "react";
-import { apiPost } from "../api/client";
 
-const PRESET_QUESTIONS = [
-  { id: "az-logs", label: "Azure OpenAI: Troubleshoot 429 / TPM throttling" },
-  { id: "az-private", label: "Azure OpenAI: Private endpoint / DNS checklist" },
-  { id: "aws-cf", label: "AWS: CloudFront SSL + alias troubleshooting checklist" },
-  { id: "tf-state", label: "Terraform: state drift & lockfile fixes (common)" },
-  { id: "quantum-1", label: "Quantum (GPT-5.1): QAOA vs VQE with a practical example" },
-];
+const card = {
+  padding: 14,
+  border: "1px solid #e5e7eb",
+  borderRadius: 16,
+  background: "#fff",
+};
+
+const row = { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" };
+
+const label = { fontWeight: 800, fontSize: 13, color: "#111827" };
+
+const selectStyle = {
+  padding: "10px 12px",
+  borderRadius: 12,
+  border: "1px solid #e5e7eb",
+  minWidth: 360,
+};
+
+const inputStyle = {
+  padding: "10px 12px",
+  borderRadius: 12,
+  border: "1px solid #e5e7eb",
+  width: 90,
+};
+
+const btn = {
+  padding: "10px 14px",
+  borderRadius: 12,
+  border: "1px solid #1d4ed8",
+  background: "#1d4ed8",
+  color: "#fff",
+  fontWeight: 900,
+  cursor: "pointer",
+};
+
+const pre = {
+  marginTop: 12,
+  whiteSpace: "pre-wrap",
+  background: "#0b1220",
+  color: "#e5e7eb",
+  padding: 12,
+  borderRadius: 12,
+  overflowX: "auto",
+  fontSize: 13,
+  lineHeight: 1.35,
+};
 
 export default function Runbooks() {
-  const [qid, setQid] = useState(PRESET_QUESTIONS[0].id);
-  const [answer, setAnswer] = useState("");
-  const [err, setErr] = useState("");
-  const selected = useMemo(() => PRESET_QUESTIONS.find((q) => q.id === qid), [qid]);
+  // ✅ Put ALL your predefined questions here
+  const QUESTIONS = useMemo(
+    () => [
+      {
+        id: "invalidate_cf",
+        label: "Invalidate CloudFront cache after deploying UI",
+        question: "How do I invalidate CloudFront cache after deploying the UI?",
+      },
+      {
+        id: "behaviors_api_spa",
+        label: "CloudFront behaviors for /api/* vs SPA routes",
+        question: "What are the CloudFront behaviors for /api/* vs SPA routes?",
+      },
+      {
+        id: "cors_apigw",
+        label: "Fix CORS issues for API Gateway behind CloudFront",
+        question: "How do I fix CORS issues for API Gateway behind CloudFront?",
+      },
+      {
+        id: "lambda_logs",
+        label: "Check Lambda logs for API 500 errors",
+        question: "How do I check Lambda logs to debug API 500 errors?",
+      },
+      // add more here…
+    ],
+    []
+  );
 
-  async function ask() {
-    setErr("");
+  const [qid, setQid] = useState(QUESTIONS[0]?.id || "");
+  const [topK, setTopK] = useState(5);
+  const [status, setStatus] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [sources, setSources] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  const selected = QUESTIONS.find((q) => q.id === qid) || QUESTIONS[0];
+
+  async function onAsk() {
+    if (!selected?.question) {
+      setStatus("Pick a question.");
+      return;
+    }
+
+    setLoading(true);
+    setStatus("Asking…");
     setAnswer("");
+    setSources([]);
+
     try {
-      const res = await apiPost("/api/rag/query", { question_id: qid });
-      setAnswer(res?.answer || JSON.stringify(res, null, 2));
+      const res = await fetch("/api/runbooks/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: selected.question, top_k: Number(topK) || 5 }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || data?.error) {
+        const msg = data?.error?.message || `HTTP ${res.status}`;
+        setStatus(`Error: ${msg}`);
+        setLoading(false);
+        return;
+      }
+
+      setAnswer(data.answer || "");
+      setSources(Array.isArray(data.sources) ? data.sources : []);
+      setStatus("Done.");
     } catch (e) {
-      setErr(String(e.message || e));
+      setStatus(`Network error: ${String(e)}`);
+    } finally {
+      setLoading(false);
     }
   }
 
   return (
-    <div style={{ padding: 16, maxWidth: 900 }}>
-      <h2>Runbooks (RAG)</h2>
-      <p style={{ marginTop: 4, opacity: 0.8 }}>
-        Predefined questions only (cost control). Next step: wire /api/rag/query to S3 + DynamoDB + GPT-5.1.
-      </p>
+    <div style={card}>
+      <h2 style={{ marginTop: 0, marginBottom: 6 }}>Runbooks</h2>
+      <div style={{ color: "#4b5563", marginBottom: 12 }}>
+        Predefined questions (cost-controlled). Powered by RAG.
+      </div>
 
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end" }}>
+      <div style={row}>
         <div>
-          <label>Question</label><br />
-          <select value={qid} onChange={(e) => setQid(e.target.value)}>
-            {PRESET_QUESTIONS.map((q) => (
-              <option key={q.id} value={q.id}>{q.label}</option>
+          <div style={label}>Pick a question</div>
+          <select
+            value={qid}
+            onChange={(e) => setQid(e.target.value)}
+            style={selectStyle}
+          >
+            {QUESTIONS.map((q) => (
+              <option key={q.id} value={q.id}>
+                {q.label}
+              </option>
             ))}
           </select>
         </div>
 
-        <button onClick={ask}>Ask</button>
+        <div>
+          <div style={label}>top_k</div>
+          <input
+            type="number"
+            min={1}
+            max={10}
+            value={topK}
+            onChange={(e) => setTopK(e.target.value)}
+            style={inputStyle}
+          />
+        </div>
+
+        <div style={{ alignSelf: "flex-end" }}>
+          <button onClick={onAsk} style={btn} disabled={loading}>
+            {loading ? "Asking…" : "Ask"}
+          </button>
+        </div>
       </div>
 
-      {selected && <p style={{ marginTop: 12 }}><b>Selected:</b> {selected.label}</p>}
-      {err && <p style={{ color: "crimson" }}>Not wired yet: {err}</p>}
-
-      {answer && (
-        <div style={{ marginTop: 16, padding: 12, border: "1px solid #ddd", borderRadius: 8 }}>
-          <pre style={{ whiteSpace: "pre-wrap" }}>{answer}</pre>
+      {status ? (
+        <div style={{ marginTop: 10, color: status.startsWith("Error") ? "#b91c1c" : "#374151" }}>
+          {status}
         </div>
-      )}
+      ) : null}
+
+      {answer ? (
+        <>
+          <div style={pre}>{answer}</div>
+
+          {sources?.length ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontWeight: 900, marginBottom: 6 }}>Sources</div>
+              <ul style={{ marginTop: 0 }}>
+                {sources.map((s, idx) => (
+                  <li key={idx}>
+                    {s.file || s.s3_key || "source"}{s.chunk !== undefined ? ` (chunk ${s.chunk})` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </>
+      ) : null}
     </div>
   );
 }

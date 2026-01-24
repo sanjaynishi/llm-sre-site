@@ -1,12 +1,9 @@
 import React, { useMemo, useState } from "react";
-import Runbook from "./pages/Runbooks"; // ✅ your file name
+import Runbook from "./pages/Runbooks";
 import Rag from "./pages/Rag";
 import Agents from "./pages/Agents";
 
-const appWrap = {
-  minHeight: "100vh",
-  background: "#f3f4f6",
-};
+const appWrap = { minHeight: "100vh", background: "#f3f4f6" };
 
 const shell = {
   maxWidth: 1100,
@@ -81,8 +78,8 @@ const contentCard = {
 export default function App() {
   const tabs = useMemo(
     () => [
-      { key: "runbook", label: "Runbook" },
-      { key: "rag", label: "RAG" },
+      { key: "runbook", label: "Runbooks" }, // predefined dropdown
+      { key: "rag", label: "RAG" },          // free-text AskRunbooks
       { key: "agents", label: "Agentic AI" },
     ],
     []
@@ -97,7 +94,7 @@ export default function App() {
           <div>
             <h1 style={title}>AIML LLM SRE / DevOps</h1>
             <p style={subtitle}>
-              Runbooks, RAG tools, and Agentic AI utilities — all inline (no popups).
+              Runbooks (predefined), RAG (ask anything), and Agentic AI utilities.
             </p>
           </div>
         </div>
