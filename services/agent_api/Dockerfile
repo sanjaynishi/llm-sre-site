@@ -21,3 +21,4 @@ PY
 COPY app.py .
 
 CMD ["app.lambda_handler"]
+
