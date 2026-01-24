@@ -19,13 +19,3 @@ output "ui_s3_buckets" {
   value       = module.site.s3_buckets
   description = "Per-domain S3 buckets used for UI hosting"
 }
-
-output "agent_config_bucket" {
-  value       = var.agent_config_bucket
-  description = "S3 bucket used for agent config + runbooks + vectors"
-}
-
-output "agent_config_prefix" {
-  value       = var.agent_config_prefix
-  description = "Prefix for agent config JSON"
-}
