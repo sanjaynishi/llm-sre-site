@@ -78,7 +78,10 @@ jobs:
         with:
           terraform_version: "1.6.6"
 
-      - name: Debug prod tfvars present
+      # IMPORTANT:
+      # CI does NOT require infra/envs/prod/terraform.tfvars.
+      # We pass required root variables via TF_VAR_* below.
+      - name: Debug prod directory (tfvars optional)
         run: |
           set -euo pipefail
           echo "Repo root:"
@@ -86,7 +89,11 @@ jobs:
           ls -la
           echo "infra/envs/prod:"
           ls -la infra/envs/prod
-          test -f infra/envs/prod/terraform.tfvars && echo "OK: terraform.tfvars exists" || (echo "::error::terraform.tfvars missing in infra/envs/prod" && exit 1)
+          if [ -f infra/envs/prod/terraform.tfvars ]; then
+            echo "terraform.tfvars exists (OK)"
+          else
+            echo "terraform.tfvars NOT present (OK - using TF_VAR_* envs)"
+          fi
 
       - name: Terraform Apply (PROD)
         working-directory: infra/envs/prod
@@ -97,7 +104,7 @@ jobs:
           TF_VAR_openai_model: gpt-5.2
           TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
 
-          # ✅ REQUIRED root variables (fixes your error)
+          # ✅ REQUIRED root variables
           TF_VAR_name_prefix: llm-sre
           TF_VAR_vectors_prefix: knowledge/vectors/prod/chroma/
           TF_VAR_runbooks_prefix: runbooks/
@@ -124,6 +131,7 @@ jobs:
           DOMAIN_WWW="www.aimlsre.com"
           TFOUT_JSON="$(terraform output -json)"
 
+          # Site module output is ui_s3_buckets
           S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_ROOT" '.ui_s3_buckets.value[$d]')"
           if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
             S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_WWW" '.ui_s3_buckets.value[$d]')"
