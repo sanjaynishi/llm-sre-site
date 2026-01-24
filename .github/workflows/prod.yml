@@ -12,7 +12,6 @@ env:
   TF_VAR_env: prod
   TF_VAR_aws_region: us-east-1
   TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
-  # Prod cert must include aimlsre.com + www.aimlsre.com
   TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_PROD_AIMLSRE }}
 
 jobs:
@@ -79,6 +78,16 @@ jobs:
         with:
           terraform_version: "1.6.6"
 
+      - name: Debug prod tfvars present
+        run: |
+          set -euo pipefail
+          echo "Repo root:"
+          pwd
+          ls -la
+          echo "infra/envs/prod:"
+          ls -la infra/envs/prod
+          test -f infra/envs/prod/terraform.tfvars && echo "OK: terraform.tfvars exists" || (echo "::error::terraform.tfvars missing in infra/envs/prod" && exit 1)
+
       - name: Terraform Apply (PROD)
         working-directory: infra/envs/prod
         env:
@@ -87,10 +96,17 @@ jobs:
           TF_VAR_s3_prefix: knowledge/
           TF_VAR_openai_model: gpt-5.2
           TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
+
+          # ✅ REQUIRED root variables (fixes your error)
+          TF_VAR_name_prefix: llm-sre
+          TF_VAR_vectors_prefix: knowledge/vectors/prod/chroma/
+          TF_VAR_runbooks_prefix: runbooks/
+          TF_VAR_domains: '["aimlsre.com","www.aimlsre.com"]'
         run: |
           set -euo pipefail
           test -n "${TF_VAR_acm_certificate_arn}" || (echo "::error::Missing TF_VAR_acm_certificate_arn" && exit 1)
           test -n "${TF_VAR_lambda_image_uri}" || (echo "::error::Missing TF_VAR_lambda_image_uri" && exit 1)
+
           terraform init -input=false
           terraform apply -auto-approve -input=false -lock-timeout=5m
 
@@ -108,7 +124,6 @@ jobs:
           DOMAIN_WWW="www.aimlsre.com"
           TFOUT_JSON="$(terraform output -json)"
 
-          # ✅ FIX: site module now outputs ui_s3_buckets (not s3_buckets)
           S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_ROOT" '.ui_s3_buckets.value[$d]')"
           if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
             S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_WWW" '.ui_s3_buckets.value[$d]')"
@@ -120,7 +135,6 @@ jobs:
             exit 1
           fi
 
-          # Find CloudFront dist by either alias
           CF_DIST_ID="$(aws cloudfront list-distributions \
             --query "DistributionList.Items[?contains(Aliases.Items, \`$DOMAIN_ROOT\`) || contains(Aliases.Items, \`$DOMAIN_WWW\`)].Id | [0]" \
             --output text)"
