@@ -1,9 +1,12 @@
-# main.tf (modules/agent_api)
+# modules/agent_api/main.tf
 # Container-image Lambda + HTTP API (APIGW v2) + CORS + S3 read + Logs
-# Notes:
-# - For package_type="Image", DO NOT set runtime/handler/filename/source_code_hash.
-# - ZIP/archive resources removed (not used for image Lambda).
-# - VECTORS_PREFIX derived from var.s3_prefix to avoid hardcoding "knowledge/".
+#
+# Fixes included:
+# - Define local.ecr_repo_name (it was missing)
+# - Safe defaults for prefixes/collection
+# - Optional ECR management (manage_ecr=true|false)
+# - Guard against empty image_uri (gives a clear error early)
+# - Keep only ONE catch-all route (ANY /api/{proxy+}) since app.py routes internally
 
 terraform {
   required_providers {
@@ -17,7 +20,13 @@ terraform {
 locals {
   api_name      = "${var.name_prefix}-agent-api-${var.env}"
   lambda_name   = "${var.name_prefix}-agent-api-${var.env}"
-  ecr_repo_name = "${var.name_prefix}-agent-api-${var.env}" # keep consistent with lambda_name/pipeline
+  ecr_repo_name = "${var.name_prefix}-agent-api-${var.env}"
+
+  # Defaults that work across envs
+  runbooks_prefix_effective      = length(trimspace(var.runbooks_prefix)) > 0 ? var.runbooks_prefix : "runbooks/"
+  vectors_prefix_effective       = length(trimspace(var.vectors_prefix)) > 0 ? var.vectors_prefix : "${var.s3_prefix}vectors/${var.env}/chroma/"
+  chroma_collection_effective    = length(trimspace(var.chroma_collection)) > 0 ? var.chroma_collection : "runbooks_${var.env}"
+  lambda_image_uri_effective     = trimspace(var.lambda_image_uri)
 }
 
 # ---------------- IAM Role ----------------
@@ -35,7 +44,6 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-# CloudWatch Logs permissions
 resource "aws_iam_role_policy_attachment" "lambda_basic_logs" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -62,17 +70,23 @@ resource "aws_iam_role_policy" "lambda_s3_read_inline" {
   policy = data.aws_iam_policy_document.lambda_s3_read.json
 }
 
-# ---------------- ECR Repo (for image) ----------------
-# Keep this if Terraform should manage the repo. If the repo already exists,
-# you may need `terraform import module.agent_api.aws_ecr_repository.agent_api <repo-name>`
-
+# ---------------- (Optional) ECR management ----------------
+# If you want Terraform to manage ECR repo + lifecycle, set var.manage_ecr=true
 resource "aws_ecr_repository" "agent_api" {
-  name = local.ecr_repo_name
-  image_scanning_configuration { scan_on_push = true }
+  count = var.manage_ecr ? 1 : 0
+
+  name                 = local.ecr_repo_name
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
 }
 
 resource "aws_ecr_lifecycle_policy" "agent_api" {
-  repository = aws_ecr_repository.agent_api.name
+  count = var.manage_ecr ? 1 : 0
+
+  repository = aws_ecr_repository.agent_api[0].name
   policy = jsonencode({
     rules = [{
       rulePriority = 1
@@ -94,7 +108,9 @@ resource "aws_lambda_function" "agent_api" {
   role          = aws_iam_role.lambda_role.arn
 
   package_type = "Image"
-  image_uri    = var.lambda_image_uri
+
+  # MUST be set for Image Lambdas (empty -> AWS complains about s3Bucket/s3Key)
+  image_uri = local.lambda_image_uri_effective
 
   timeout     = 30
   memory_size = 512
@@ -110,17 +126,17 @@ resource "aws_lambda_function" "agent_api" {
       # S3-backed config for dropdowns/catalog
       AGENT_CONFIG_BUCKET = var.agent_config_bucket
       AGENT_CONFIG_PREFIX = var.agent_config_prefix
+      AGENTS_KEY          = var.agents_key
 
       # Runbooks / vectors (same bucket)
       S3_BUCKET       = var.agent_config_bucket
-      S3_PREFIX       = var.s3_prefix          # e.g. "knowledge/"
-      RUNBOOKS_PREFIX = "runbooks/"            # resolves to "knowledge/runbooks/"
-      AGENTS_KEY      = "agents.json"
+      S3_PREFIX       = var.s3_prefix
+      RUNBOOKS_PREFIX = local.runbooks_prefix_effective
 
       # RAG vector store
-      VECTORS_PREFIX    = "${var.s3_prefix}vectors/dev/chroma/" # <- avoids hardcoding "knowledge/"
-      CHROMA_COLLECTION = "runbooks_dev"
-      EMBED_MODEL       = "text-embedding-3-small"
+      VECTORS_PREFIX    = local.vectors_prefix_effective
+      CHROMA_COLLECTION = local.chroma_collection_effective
+      EMBED_MODEL       = var.embed_model
     }
   }
 
@@ -128,6 +144,13 @@ resource "aws_lambda_function" "agent_api" {
     aws_iam_role_policy_attachment.lambda_basic_logs,
     aws_iam_role_policy.lambda_s3_read_inline
   ]
+
+  lifecycle {
+    precondition {
+      condition     = local.lambda_image_uri_effective != ""
+      error_message = "lambda_image_uri must be non-empty for package_type=Image. Set TF_VAR_lambda_image_uri (recommended) or in terraform.tfvars."
+    }
+  }
 }
 
 # ---------------- API Gateway v2 (HTTP API) ----------------
@@ -137,11 +160,7 @@ resource "aws_apigatewayv2_api" "http_api" {
   protocol_type = "HTTP"
 
   cors_configuration {
-    allow_origins = [
-      "https://dev.aimlsre.com",
-      "https://aimlsre.com",
-      "https://www.aimlsre.com"
-    ]
+    allow_origins = var.cors_allow_origins
     allow_methods = ["GET", "POST", "OPTIONS"]
     allow_headers = [
       "Content-Type",
@@ -168,47 +187,7 @@ resource "aws_apigatewayv2_integration" "lambda_proxy" {
   payload_format_version = "2.0"
 }
 
-# ---------------- Routes ----------------
-# Keep explicit routes you need + optional catch-all
-
-resource "aws_apigatewayv2_route" "health" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "GET /api/health"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "agents" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "GET /api/agents"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "agent_run" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "POST /api/agent/run"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "runbooks_ask" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "POST /api/runbooks/ask"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-# Optional routes (only keep if app.py implements these GET endpoints)
-resource "aws_apigatewayv2_route" "runbooks" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "GET /api/runbooks"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "doc" {
-  api_id    = aws_apigatewayv2_api.http_api.id
-  route_key = "GET /api/doc"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-# Catch-all for future endpoints (safe with explicit routes)
+# One catch-all route; app.py does routing by path/method
 resource "aws_apigatewayv2_route" "api_proxy" {
   api_id    = aws_apigatewayv2_api.http_api.id
   route_key = "ANY /api/{proxy+}"

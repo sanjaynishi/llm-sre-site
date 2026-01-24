@@ -1,0 +1,47 @@
+name: Build & Push agent_api Image (PROD)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  push-prod-image:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS creds (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-prod
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Lambda image (agent_api) - tag latest + sha
+        env:
+          AWS_ACCOUNT_ID: "830330555687"
+          AWS_REGION: "us-east-1"
+          IMAGE_REPO: "llm-sre-agent-api-prod"
+          SHA_TAG: "${{ github.sha }}"
+        run: |
+          set -euo pipefail
+          IMAGE_URI_SHA="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}:${SHA_TAG}"
+          IMAGE_URI_LATEST="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}:latest"
+
+          docker build --progress=plain -t "$IMAGE_URI_SHA" services/agent_api
+          docker tag "$IMAGE_URI_SHA" "$IMAGE_URI_LATEST"
+
+          docker push "$IMAGE_URI_SHA"
+          docker push "$IMAGE_URI_LATEST"
+
+          echo "Pushed:"
+          echo " - $IMAGE_URI_SHA"
+          echo " - $IMAGE_URI_LATEST"

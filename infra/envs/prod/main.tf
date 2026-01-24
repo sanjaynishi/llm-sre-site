@@ -1,6 +1,7 @@
 # infra/envs/prod/main.tf
 
 terraform {
+  required_version = ">= 1.5.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -13,54 +14,67 @@ provider "aws" {
   region = var.aws_region
 }
 
-data "aws_caller_identity" "current" {}
-
-# --- S3 bucket for agent config (shared by Lambda) ---
-resource "aws_s3_bucket" "agent_config" {
-  bucket = "llm-sre-agent-config-${var.env}-${data.aws_caller_identity.current.account_id}"
-}
-
-resource "aws_s3_bucket_public_access_block" "agent_config" {
-  bucket                  = aws_s3_bucket.agent_config.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# --- Agent API (Lambda + HTTP API) ---
+# ============================================================
+# Agent API (Site depends on API endpoint for /api/* origin)
+# ============================================================
 module "agent_api" {
   source = "../../modules/agent_api"
 
+  # Required
   env        = var.env
   aws_region = var.aws_region
 
-  # ✅ OpenAI settings (same as dev)
+  # Naming (optional in module, but good to pass)
+  name_prefix = var.name_prefix
+
+  # OpenAI
   openai_api_key = var.openai_api_key
   openai_model   = var.openai_model
 
-  # ✅ Config bucket for dropdowns / allowlists (same pattern as dev)
-  agent_config_bucket = aws_s3_bucket.agent_config.bucket
-  agent_config_prefix = "agent-config"
+  # Container-image Lambda
+  lambda_src_dir   = "${path.module}/../../../services/agent_api"
+  lambda_image_uri = var.lambda_image_uri
 
-  # IMPORTANT: path from infra/envs/prod -> repo_root/services/agent_api
-  lambda_src_dir = "${path.module}/../../../services/agent_api"
+  # IMPORTANT: avoid Terraform touching ECR if your IAM user lacks ECR write perms
+  manage_ecr = false
+
+  # Config / knowledge bucket + prefixes
+  agent_config_bucket = var.agent_config_bucket
+  agent_config_prefix = var.agent_config_prefix
+
+  # Knowledge layout
+  s3_prefix        = var.s3_prefix
+  runbooks_prefix  = var.runbooks_prefix
+  vectors_prefix   = var.vectors_prefix
+  chroma_collection = var.chroma_collection
+  embed_model      = var.embed_model
+
+  # Optional
+  agents_key = "agents.json"
+
+  # CORS (prod + dev)
+  cors_allow_origins = [
+    "https://aimlsre.com",
+    "https://www.aimlsre.com",
+    "https://dev.aimlsre.com",
+  ]
 }
 
-# --- Site (CloudFront) ---
+# ============================================================
+# Site (CloudFront + S3)
+# One distribution per domain in var.domains (map required by module)
+# ============================================================
 module "site" {
   source              = "../../modules/site"
   aws_region          = var.aws_region
   acm_certificate_arn = var.acm_certificate_arn
-  env                 = "prod"
-
-  domains = {
-    "aimlsre.com"     = "aimlsre.com"
-    "www.aimlsre.com" = "www.aimlsre.com"
-  }
+  env                 = var.env
 
   enable_placeholder = false
 
-  # ✅ Always point to whatever API Terraform deployed (avoid hardcoding)
+  # API GW hostname for CloudFront origin (no scheme, no trailing slash)
   api_domain_name = replace(replace(module.agent_api.http_api_endpoint, "https://", ""), "/", "")
+
+  # module.site expects map(string)
+  domains = { for d in var.domains : d => d }
 }

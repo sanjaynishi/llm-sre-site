@@ -1,8 +1,6 @@
 name: Deploy PROD
 
 on:
-  push:
-    branches: [ "prod" ]
   workflow_dispatch: {}
 
 permissions:
@@ -10,14 +8,21 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
   TF_IN_AUTOMATION: "true"
-  TF_VAR_acm_certificate_arn: ${{ secrets.TF_VAR_acm_certificate_arn_prod }}
+  TF_VAR_env: prod
+  TF_VAR_aws_region: us-east-1
+  TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+  # Prod cert must include aimlsre.com + www.aimlsre.com
+  TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_PROD_AIMLSRE }}
+  TF_VAR_lambda_image_uri: "dummy"
 
 jobs:
   deploy-prod:
     runs-on: ubuntu-latest
     environment: prod
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout
@@ -26,9 +31,10 @@ jobs:
       - name: Configure AWS creds (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::830330555687:role/llm-sre-gha-prod
+          aws-region: ${{ env.TF_VAR_aws_region }}
 
+      # ---------- UI BUILD ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -44,32 +50,104 @@ jobs:
         working-directory: ui
         run: npm run build
 
+      # ---------- LAMBDA IMAGE (ECR) ----------
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Lambda image (agent_api)
+        env:
+          AWS_ACCOUNT_ID: "830330555687"
+          AWS_REGION: "us-east-1"
+          IMAGE_REPO: "llm-sre-agent-api-prod"
+          IMAGE_TAG: "${{ github.sha }}"
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          docker build --progress=plain -t "$IMAGE_URI" services/agent_api
+          docker push "$IMAGE_URI"
+
+      - name: Verify IMAGE_URI is set
+        run: |
+          set -euo pipefail
+          test -n "${IMAGE_URI:-}" || (echo "::error::IMAGE_URI missing (ECR build/push step failed)" && exit 1)
+          echo "IMAGE_URI=${IMAGE_URI}"
+
+      # ---------- TERRAFORM APPLY (PROD) ----------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.6"
 
-      - name: Terraform Init (PROD)
-        working-directory: infra/envs/prod
-        run: terraform init
-
       - name: Terraform Apply (PROD)
         working-directory: infra/envs/prod
-        run: terraform apply -auto-approve -input=false -lock-timeout=5m -var-file=terraform.tfvars
+        env:
+          TF_VAR_agent_config_bucket: llm-sre-agent-config-prod-830330555687
+          TF_VAR_agent_config_prefix: agent-config
+          TF_VAR_s3_prefix: knowledge/
+          TF_VAR_openai_model: gpt-5.2
+          TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
+          TF_VAR_vectors_prefix: knowledge/vectors/prod/chroma/
+          TF_VAR_runbooks_prefix: runbooks/
+          TF_VAR_domain_name: aimlsre.com
+          TF_VAR_www_domain: www.aimlsre.com
+          # Keep cert here too (overrides job env if needed)
+          TF_VAR_acm_certificate_arn: ${{ secrets.ACM_CERT_ARN_PROD_AIMLSRE }}
+        run: |
+          set -euo pipefail
+          test -n "${TF_VAR_acm_certificate_arn}" || (echo "Missing TF_VAR_acm_certificate_arn" && exit 1)
+          test -n "${TF_VAR_lambda_image_uri}" || (echo "Missing TF_VAR_lambda_image_uri" && exit 1)
+          terraform init -input=false
+          terraform apply -auto-approve -input=false -lock-timeout=5m
+
+      # ---------- DEPLOY UI TO S3 + INVALIDATE CF ----------
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Read Terraform outputs (PROD)
         id: tfout
         working-directory: infra/envs/prod
         run: |
-          echo "S3_BUCKET=$(terraform output -raw s3_bucket_prod)" >> $GITHUB_OUTPUT
-          echo "CF_DIST_ID=$(terraform output -raw cloudfront_dist_id_prod)" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          DOMAIN_ROOT="aimlsre.com"
+          DOMAIN_WWW="www.aimlsre.com"
+          TFOUT_JSON="$(terraform output -json)"
+
+          # Prefer root domain bucket mapping; fallback to www if needed
+          S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_ROOT" '.s3_buckets.value[$d]')"
+          if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
+            S3_BUCKET="$(echo "$TFOUT_JSON" | jq -r --arg d "$DOMAIN_WWW" '.s3_buckets.value[$d]')"
+          fi
+          if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
+            echo "::error::Could not read S3 bucket from terraform output for $DOMAIN_ROOT or $DOMAIN_WWW"
+            echo "$TFOUT_JSON" | jq .
+            exit 1
+          fi
+
+          # Find CloudFront dist by either alias
+          CF_DIST_ID="$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?contains(Aliases.Items, \`$DOMAIN_ROOT\`) || contains(Aliases.Items, \`$DOMAIN_WWW\`)].Id | [0]" \
+            --output text)"
+
+          if [ -z "$CF_DIST_ID" ] || [ "$CF_DIST_ID" = "None" ]; then
+            echo "::error::Could not find CloudFront distribution id for aliases $DOMAIN_ROOT / $DOMAIN_WWW"
+            exit 1
+          fi
+
+          echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "CF_DIST_ID=$CF_DIST_ID" >> "$GITHUB_OUTPUT"
+          echo "Resolved: S3_BUCKET=$S3_BUCKET  CF_DIST_ID=$CF_DIST_ID"
 
       - name: Sync UI to S3
         run: |
-          aws s3 sync ui/dist s3://${{ steps.tfout.outputs.S3_BUCKET }}/ --delete
+          set -euo pipefail
+          aws s3 sync ui/dist "s3://${{ steps.tfout.outputs.S3_BUCKET }}/" --delete
 
       - name: Invalidate CloudFront
         run: |
+          set -euo pipefail
           aws cloudfront create-invalidation \
-            --distribution-id ${{ steps.tfout.outputs.CF_DIST_ID }} \
-            --paths "/*"
+            --distribution-id "${{ steps.tfout.outputs.CF_DIST_ID }}" \
+            --paths "/index.html" "/assets/*"

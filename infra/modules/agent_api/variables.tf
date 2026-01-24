@@ -1,63 +1,85 @@
-variable "env" {
-  type = string
-}
+# modules/agent_api/variables.tf
 
-variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
+variable "env" { type = string }
+variable "aws_region" { type = string }
 
 variable "name_prefix" {
   type    = string
   default = "llm-sre"
 }
 
-# Path to your lambda source folder (services/agent_api)
-variable "lambda_src_dir" {
-  type = string
-}
-
-# Optional: if you want CloudFront or other origins to call the API (wire later)
-variable "allowed_origins" {
-  type    = list(string)
-  default = []
-}
-
 variable "openai_api_key" {
-  description = "OpenAI API key injected from GitHub Actions"
-  type        = string
-  sensitive   = true
+  type      = string
+  sensitive = true
 }
 
 variable "openai_model" {
-  description = "OpenAI model used by the agent API"
-  type        = string
-  default     = "gpt-5.2"
+  type    = string
+  default = "gpt-5.2"
 }
 
-# ✅ Single bucket used for BOTH:
-# - config JSON (agent-config/*)
-# - runbooks PDFs (knowledge/runbooks/*)
-variable "agent_config_bucket" {
+variable "lambda_src_dir" {
   type        = string
-  description = "Existing S3 bucket that stores agent config JSON and runbooks PDFs"
-}
-
-# Config JSON folder (agents.json, allowlists.json, etc.)
-variable "agent_config_prefix" {
-  type        = string
-  description = "Prefix/folder in the bucket where config JSON files are stored (e.g., agent-config)"
-  default     = "agent-config"
-}
-
-# Runbooks base prefix (e.g., knowledge/ → knowledge/runbooks/*.pdf)
-variable "s3_prefix" {
-  type        = string
-  description = "Prefix under the bucket for docs/runbooks (e.g., knowledge/)"
-  default     = "knowledge/"
+  description = "Path to services/agent_api (used by CI docker build, not by Terraform directly here)"
+  default     = ""
 }
 
 variable "lambda_image_uri" {
   type        = string
-  description = "ECR image URI for the agent_api Lambda container"
+  description = "Full ECR image URI including tag. Must be non-empty for Image Lambda."
+}
+
+variable "agent_config_bucket" { type = string }
+variable "agent_config_prefix" { type = string }
+
+variable "s3_prefix" {
+  type        = string
+  description = "Base prefix under the bucket, e.g. knowledge/"
+  default     = "knowledge/"
+}
+
+variable "runbooks_prefix" {
+  type        = string
+  description = "Prefix for runbooks relative to S3_PREFIX (or full if you pass full)."
+  default     = "runbooks/"
+}
+
+variable "vectors_prefix" {
+  type        = string
+  description = "Full S3 prefix to chroma store (recommended). Example: knowledge/vectors/prod/chroma/"
+  default     = ""
+}
+
+variable "chroma_collection" {
+  type        = string
+  description = "Chroma collection name"
+  default     = ""
+}
+
+variable "embed_model" {
+  type    = string
+  default = "text-embedding-3-small"
+}
+
+variable "agents_key" {
+  type    = string
+  default = "agents.json"
+}
+
+variable "cors_allow_origins" {
+  type        = list(string)
+  description = "Allowed CORS origins for API Gateway"
+  default = [
+    "https://dev.aimlsre.com",
+    "https://aimlsre.com",
+    "https://www.aimlsre.com"
+  ]
+}
+
+# IMPORTANT:
+# Keep only ONE manage_ecr variable. Default false so prod doesn't require ECR admin perms.
+variable "manage_ecr" {
+  type        = bool
+  description = "If true, Terraform manages ECR repo + lifecycle policy. If false, it will NOT touch ECR."
+  default     = false
 }

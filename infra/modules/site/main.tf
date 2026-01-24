@@ -19,6 +19,9 @@ data "aws_caller_identity" "current" {}
 ########################################
 locals {
   # Convert domains to safe bucket slugs
+  # Example:
+  #   aimlsre.com     -> aimlsre
+  #   www.aimlsre.com -> www-aimlsre
   domain_slug = {
     for d in var.domains :
     d => replace(replace(d, ".com", ""), ".", "-")
@@ -45,7 +48,6 @@ data "aws_cloudfront_origin_request_policy" "all_viewer_except_host" {
 resource "aws_s3_bucket" "site" {
   for_each = local.domains_map
 
-  # IMPORTANT: wrap multiline ternary in parentheses so HCL parses it correctly
   bucket = (
     var.env == "prod"
     ? "s3-llm-sre-${local.domain_slug[each.key]}"
@@ -102,7 +104,8 @@ resource "aws_cloudfront_distribution" "cdn" {
   comment             = "CDN for ${each.key}"
   default_root_object = "index.html"
 
-  aliases = var.env == "prod" ? concat([each.key], ["www.${each.key}"]) : [each.key]
+  # FIX: one distribution per domain. If you want www, add it as its own entry in var.domains.
+  aliases = [each.key]
 
   # -----------------------
   # S3 origin (REST endpoint) + OAC
@@ -112,7 +115,7 @@ resource "aws_cloudfront_distribution" "cdn" {
     origin_id                = "s3-${each.key}"
     origin_access_control_id = aws_cloudfront_origin_access_control.oac[each.key].id
 
-    # IMPORTANT for OAC + S3 REST origins
+    # Required for S3 REST origin when using OAC
     s3_origin_config {
       origin_access_identity = ""
     }
@@ -137,29 +140,10 @@ resource "aws_cloudfront_distribution" "cdn" {
   }
 
   # ============================================================
-  # Static assets MUST NOT be rewritten to index.html
-  # Keep this ordered behavior
+  # /assets/* MUST NOT be rewritten to index.html
   # ============================================================
   ordered_cache_behavior {
     path_pattern           = "/assets/*"
-    target_origin_id       = "s3-${each.key}"
-    viewer_protocol_policy = "redirect-to-https"
-
-    allowed_methods = ["GET", "HEAD", "OPTIONS"]
-    cached_methods  = ["GET", "HEAD", "OPTIONS"]
-
-    compress = true
-
-    forwarded_values {
-      query_string = false
-      cookies { forward = "none" }
-    }
-  }
-
-  # -----------------------
-  # Default (SPA pages)
-  # -----------------------
-  default_cache_behavior {
     target_origin_id       = "s3-${each.key}"
     viewer_protocol_policy = "redirect-to-https"
 
@@ -194,9 +178,26 @@ resource "aws_cloudfront_distribution" "cdn" {
     }
   }
 
+  # -----------------------
+  # Default (SPA pages)
+  # -----------------------
+  default_cache_behavior {
+    target_origin_id       = "s3-${each.key}"
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS"]
+    cached_methods  = ["GET", "HEAD", "OPTIONS"]
+
+    compress = true
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+  }
+
   # ============================================================
-  # SPA-friendly behavior: ONLY 404 → index.html
-  # (Do NOT map 403 → index.html)
+  # SPA-friendly: ONLY 404 → index.html
   # ============================================================
   custom_error_response {
     error_code            = 404
@@ -209,9 +210,7 @@ resource "aws_cloudfront_distribution" "cdn" {
     geo_restriction { restriction_type = "none" }
   }
 
-  # Viewer certificate must be conditional:
-  # - If ACM cert is provided -> set ssl_support_method + minimum_protocol_version
-  # - Else -> use CloudFront default certificate
+  # Viewer certificate conditional:
   dynamic "viewer_certificate" {
     for_each = (var.acm_certificate_arn != null && var.acm_certificate_arn != "") ? [1] : []
     content {
@@ -249,7 +248,9 @@ data "aws_iam_policy_document" "allow_cf_read" {
     condition {
       test     = "StringEquals"
       variable = "AWS:SourceArn"
-      values   = [aws_cloudfront_distribution.cdn[each.key].arn]
+
+      # FIX: avoid invalid-index crash on partial create / failed dist
+      values = compact([try(aws_cloudfront_distribution.cdn[each.key].arn, null)])
     }
   }
 }
