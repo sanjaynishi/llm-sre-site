@@ -2,11 +2,12 @@
 # Container-image Lambda + HTTP API (APIGW v2) + CORS + S3 read + Logs
 #
 # Fixes included:
-# - Define local.ecr_repo_name (it was missing)
+# - Defines local.ecr_repo_name
 # - Safe defaults for prefixes/collection
 # - Optional ECR management (manage_ecr=true|false)
-# - Guard against empty image_uri (gives a clear error early)
-# - Keep only ONE catch-all route (ANY /api/{proxy+}) since app.py routes internally
+# - prevent_destroy on ECR repo so CI never tries to delete a non-empty repo
+# - Guard against empty image_uri (clear error early)
+# - One catch-all route (ANY /api/{proxy+}) since app routes internally
 
 terraform {
   required_providers {
@@ -23,10 +24,11 @@ locals {
   ecr_repo_name = "${var.name_prefix}-agent-api-${var.env}"
 
   # Defaults that work across envs
-  runbooks_prefix_effective      = length(trimspace(var.runbooks_prefix)) > 0 ? var.runbooks_prefix : "runbooks/"
-  vectors_prefix_effective       = length(trimspace(var.vectors_prefix)) > 0 ? var.vectors_prefix : "${var.s3_prefix}vectors/${var.env}/chroma/"
-  chroma_collection_effective    = length(trimspace(var.chroma_collection)) > 0 ? var.chroma_collection : "runbooks_${var.env}"
-  lambda_image_uri_effective     = trimspace(var.lambda_image_uri)
+  runbooks_prefix_effective   = length(trimspace(var.runbooks_prefix)) > 0 ? var.runbooks_prefix : "runbooks/"
+  vectors_prefix_effective    = length(trimspace(var.vectors_prefix)) > 0 ? var.vectors_prefix : "${var.s3_prefix}vectors/${var.env}/chroma/"
+  chroma_collection_effective = length(trimspace(var.chroma_collection)) > 0 ? var.chroma_collection : "runbooks_${var.env}"
+
+  lambda_image_uri_effective = trimspace(var.lambda_image_uri)
 }
 
 # ---------------- IAM Role ----------------
@@ -81,6 +83,11 @@ resource "aws_ecr_repository" "agent_api" {
   image_scanning_configuration {
     scan_on_push = true
   }
+
+  # ✅ Critical: never let Terraform delete the repo (prevents "RepositoryNotEmptyException")
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_ecr_lifecycle_policy" "agent_api" {
@@ -109,7 +116,7 @@ resource "aws_lambda_function" "agent_api" {
 
   package_type = "Image"
 
-  # MUST be set for Image Lambdas (empty -> AWS complains about s3Bucket/s3Key)
+  # MUST be set for Image Lambdas
   image_uri = local.lambda_image_uri_effective
 
   timeout     = 30
@@ -148,7 +155,7 @@ resource "aws_lambda_function" "agent_api" {
   lifecycle {
     precondition {
       condition     = local.lambda_image_uri_effective != ""
-      error_message = "lambda_image_uri must be non-empty for package_type=Image. Set TF_VAR_lambda_image_uri (recommended) or in terraform.tfvars."
+      error_message = "lambda_image_uri must be non-empty for package_type=Image. Set TF_VAR_lambda_image_uri in CI (recommended) or in terraform.tfvars."
     }
   }
 }
@@ -187,14 +194,13 @@ resource "aws_apigatewayv2_integration" "lambda_proxy" {
   payload_format_version = "2.0"
 }
 
-# One catch-all route; app.py does routing by path/method
+# One catch-all route; app routes internally
 resource "aws_apigatewayv2_route" "api_proxy" {
   api_id    = aws_apigatewayv2_api.http_api.id
   route_key = "ANY /api/{proxy+}"
   target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
 }
 
-# Allow API Gateway to invoke Lambda
 resource "aws_lambda_permission" "allow_apigw" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
