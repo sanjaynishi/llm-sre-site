@@ -15,18 +15,18 @@ variable "aws_account_id" {
 
 variable "retention_days" {
   type        = number
-  description = "How many days to retain CloudFront access logs in S3"
+  description = "How many days to retain CloudFront/APIGW logs in S3 (raw)"
   default     = 30
 }
 
 variable "cloudfront_account_id" {
-  description = "AWS-managed CloudFront log delivery account ID (global, fixed)"
+  description = "CloudFront log-delivery account id used in bucket policy (only needed if you enable CloudFront standard logs)"
   type        = string
   default     = "114774131450"
 }
 
 variable "enable_cloudfront_log_write" {
-  description = "Enable CloudFront standard access logs into the analytics bucket"
+  description = "Enable bucket policy that allows CloudFront standard logging to write into this bucket"
   type        = bool
   default     = false
 }

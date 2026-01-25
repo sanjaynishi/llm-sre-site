@@ -1,4 +1,4 @@
-data "aws_caller_identity" "current" {}
+#data "aws_caller_identity" "current" {}
 
 locals {
   # Unique per account + env
@@ -54,12 +54,4 @@ resource "aws_s3_object" "allowlists_json" {
   source       = "${local.agent_config_dir}/allowlists.json"
   content_type = "application/json"
   etag         = filemd5("${local.agent_config_dir}/allowlists.json")
-}
-
-output "agent_config_bucket" {
-  value = aws_s3_bucket.agent_config.bucket
-}
-
-output "agent_config_prefix" {
-  value = local.agent_config_prefix
 }

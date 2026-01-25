@@ -1,3 +1,6 @@
+# If not already there
+#data "aws_caller_identity" "current" {}
+
 variable "env" { type = string }
 variable "aws_region" { type = string }
 
@@ -52,3 +55,30 @@ variable "analytics_bucket_domain_name" {
   type        = string
   default     = ""
 }
+
+# ------------------------------------
+# RAG config
+# ------------------------------------
+variable "chroma_collection" {
+  type        = string
+  description = "Chroma collection name"
+  default     = "runbooks_dev"
+}
+
+variable "embed_model" {
+  type        = string
+  description = "Embedding model for indexing/query"
+  default     = "text-embedding-3-small"
+}
+
+variable "vectors_prefix" {
+  type        = string
+  description = "Prefix under agent_config_bucket where Chroma store files are uploaded"
+}
+
+variable "runbooks_prefix" {
+  type        = string
+  description = "Prefix under agent_config_bucket where runbook PDFs live"
+}
+
+

@@ -1,5 +1,5 @@
 output "analytics_bucket_name" {
-  description = "Name of the S3 bucket storing CloudFront access logs"
+  description = "Name of the S3 bucket storing analytics/logs"
   value       = aws_s3_bucket.analytics.bucket
 }
 
@@ -11,8 +11,4 @@ output "analytics_bucket_domain_name" {
 output "analytics_bucket_arn" {
   description = "ARN of the analytics bucket"
   value       = aws_s3_bucket.analytics.arn
-}
-
-output "analytics_bucket" {
-  value = aws_s3_bucket.analytics.bucket
 }

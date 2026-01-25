@@ -1,6 +1,6 @@
 # modules/site/main.tf
 # Static UI hosting in S3 + CloudFront (OAC) + optional API origin (/api/*)
-# + CloudFront access logs to a central analytics bucket (S3)
+# + CloudFront standard access logs to a central analytics bucket (S3)
 
 terraform {
   required_providers {
@@ -12,16 +12,19 @@ terraform {
 }
 
 locals {
-  # Map of domain -> bucket name (you already standardized this style)
-  # Example: aimlsre.com -> s3-llm-sre-aimlsre
+  # Domain -> bucket name
+  # Example:
+  #   dev.aimlsre.com  -> s3-llm-sre-dev-aimlsre
+  #   www.aimlsre.com  -> s3-llm-sre-www-aimlsre
+  #   aimlsre.com      -> s3-llm-sre-aimlsre
   buckets = {
     for d, host in var.domains :
-    d => "s3-${var.name_prefix}-${replace(replace(d, "www.", "www-"), ".", "-")}"
+    d => "s3-${var.name_prefix}-${replace(replace(replace(d, "www.", "www-"), ".com", ""), ".", "-")}"
   }
 
-  # Prefix for CloudFront logs per env
   cf_log_prefix = "cloudfront/${var.env}/"
 }
+
 
 # -----------------------------
 # S3 buckets (one per domain)
@@ -61,7 +64,7 @@ resource "aws_s3_object" "placeholder" {
 }
 
 # -----------------------------
-# CloudFront Origin Access Control
+# CloudFront Origin Access Control (OAC)
 # -----------------------------
 resource "aws_cloudfront_origin_access_control" "oac" {
   for_each = aws_s3_bucket.site
@@ -75,9 +78,9 @@ resource "aws_cloudfront_origin_access_control" "oac" {
 
 # -----------------------------
 # CloudFront distribution (one per domain)
-# - default origin: S3 (UI)
+# - default origin: S3 (UI via OAC)
 # - optional api origin for /api/*
-# - logs -> central analytics bucket
+# - logs -> central analytics bucket (standard logs)
 # -----------------------------
 resource "aws_cloudfront_distribution" "cdn" {
   for_each = aws_s3_bucket.site
@@ -96,13 +99,17 @@ resource "aws_cloudfront_distribution" "cdn" {
     minimum_protocol_version = "TLSv1.2_2021"
   }
 
-  # --- UI (S3) origin ---
+  # --- UI (S3) origin via OAC ---
   origin {
     domain_name              = "${each.value.bucket}.s3.${var.aws_region}.amazonaws.com"
     origin_id                = "s3-${each.key}"
     origin_access_control_id = aws_cloudfront_origin_access_control.oac[each.key].id
 
-    s3_origin_config {}
+    # ✅ REQUIRED by Terraform schema even when using OAC
+    # Must be present, can be empty when OAC is used
+    s3_origin_config {
+      origin_access_identity = ""
+    }
   }
 
   # --- API origin (optional) ---
@@ -113,11 +120,11 @@ resource "aws_cloudfront_distribution" "cdn" {
       origin_id   = "api-${each.key}"
 
       custom_origin_config {
-        http_port              = 80
-        https_port             = 443
-        origin_protocol_policy = "https-only"
-        origin_ssl_protocols   = ["TLSv1.2"]
-        origin_read_timeout    = 30
+        http_port                = 80
+        https_port               = 443
+        origin_protocol_policy   = "https-only"
+        origin_ssl_protocols     = ["TLSv1.2"]
+        origin_read_timeout      = 30
         origin_keepalive_timeout = 5
       }
     }

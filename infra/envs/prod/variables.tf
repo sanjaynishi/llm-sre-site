@@ -110,8 +110,8 @@ variable "lambda_image_tag" {
 
 
 variable "ui_bucket_name" {
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "analytics_bucket_domain_name" {
