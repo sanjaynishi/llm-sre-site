@@ -36,12 +36,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
+# IMPORTANT: chromadb checks sqlite3 version at import time.
+# This shim must be in place before any chromadb import occurs.
 try:
-    import pysqlite3.dbapi2 as sqlite3
+    import pysqlite3.dbapi2 as sqlite3  # type: ignore
+
     sys.modules["sqlite3"] = sqlite3
 except Exception:
     pass
-
 
 # ---- disable Chroma telemetry ----
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -53,7 +55,6 @@ try:
     import boto3
 except Exception:
     boto3 = None
-
 
 # ---------------- Config ----------------
 
@@ -92,8 +93,8 @@ _openai_client = None
 _chroma_client = None
 _chroma_collection = None
 
-
 # ---------------- Basic helpers ----------------
+
 
 def _log(msg: str) -> None:
     # Keep it simple; shows up in CloudWatch Logs
@@ -166,10 +167,24 @@ def _get_body_json(event: dict) -> dict:
 
 # ---------------- HTTP helpers (stdlib) ----------------
 
+# Some RSS providers block "generic bots" or require Accept headers.
+# These defaults reduce 403s and other blocks.
+_DEFAULT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 llm-sre-agent/1.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "close",
+}
+
+
 def _http_get_text(url: str, timeout_sec: int = 8) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "llm-sre-agent/1.0"})
+    req = urllib.request.Request(url, headers=_DEFAULT_HTTP_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            # Some feeds are gzip; urllib typically handles it, but decode safely.
             return resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
@@ -186,7 +201,9 @@ def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
 
 def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    req_headers = {"Content-Type": "application/json", "User-Agent": "llm-sre-agent/1.0"}
+    req_headers = {"Content-Type": "application/json"}
+    # Use the same "browser-ish" defaults plus caller headers
+    req_headers.update(_DEFAULT_HTTP_HEADERS)
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
@@ -230,13 +247,37 @@ RSS_SOURCES = [
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
 
 AI_KEYWORDS = [
-    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
-    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
-    "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
+    "ai",
+    "llm",
+    "openai",
+    "gpt",
+    "claude",
+    "anthropic",
+    "gemini",
+    "deepmind",
+    "mistral",
+    "hugging face",
+    "transformer",
+    "rag",
+    "agentic",
+    "multimodal",
+    "inference",
+    "alignment",
+    "safety",
+    "eval",
+    "evals",
+    "rlhf",
+    "prompt",
 ]
 DROP_PATTERNS = [
-    r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
-    r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b",
+    r"\bdoom\b",
+    r"\bpanic\b",
+    r"\bdestroy\b",
+    r"\bapocalypse\b",
+    r"\bterrifying\b",
+    r"\breplaces all jobs\b",
+    r"\bend of\b",
+    r"\bsingularity\b",
 ]
 
 _news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
@@ -311,15 +352,17 @@ def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
             except Exception:
                 published_at = None
 
-        items.append({
-            "id": link[-16:] if len(link) > 16 else link,
-            "title": title[:180],
-            "url": link,
-            "summary": desc[:260],
-            "source": source_name,
-            "tag": tag,
-            "publishedAt": published_at,
-        })
+        items.append(
+            {
+                "id": link[-16:] if len(link) > 16 else link,
+                "title": title[:180],
+                "url": link,
+                "summary": desc[:260],
+                "source": source_name,
+                "tag": tag,
+                "publishedAt": published_at,
+            }
+        )
 
     return items
 
@@ -366,15 +409,17 @@ def _fetch_hn_items_with_errors() -> Tuple[List[dict], List[dict]]:
                 except Exception:
                     pass
 
-            out.append({
-                "id": link[-16:] if len(link) > 16 else link,
-                "title": title[:180],
-                "url": link,
-                "summary": "",
-                "source": "Hacker News",
-                "tag": "Community Signal",
-                "publishedAt": published_at,
-            })
+            out.append(
+                {
+                    "id": link[-16:] if len(link) > 16 else link,
+                    "title": title[:180],
+                    "url": link,
+                    "summary": "",
+                    "source": "Hacker News",
+                    "tag": "Community Signal",
+                    "publishedAt": published_at,
+                }
+            )
     except Exception as e:
         errors.append({"source": "Hacker News", "url": "hn.algolia.com", "error": str(e)[:400]})
 
@@ -397,7 +442,7 @@ def _handle_get_news_latest(event: dict) -> dict:
     payload = {
         "updatedAt": _now_iso(),
         "items": items,
-        # Include errors so you can see if outbound is blocked (VPC/NAT/DNS)
+        # Include errors so you can see if outbound is blocked (VPC/NAT/DNS) or feed blocks with 403.
         "errors": (rss_errors + hn_errors)[:20],
     }
     _news_cache["ts"] = now
@@ -409,17 +454,22 @@ def _handle_get_debug_news(event: dict) -> dict:
     # Force fetch + return errors, no cache
     rss_items, rss_errors = _fetch_rss_items_with_errors()
     hn_items, hn_errors = _fetch_hn_items_with_errors()
-    return _json_response(event, 200, {
-        "ok": True,
-        "updatedAt": _now_iso(),
-        "rss_count": len(rss_items),
-        "hn_count": len(hn_items),
-        "errors": (rss_errors + hn_errors),
-        "sample_titles": [x.get("title") for x in (rss_items + hn_items)[:5]],
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "ok": True,
+            "updatedAt": _now_iso(),
+            "rss_count": len(rss_items),
+            "hn_count": len(hn_items),
+            "errors": (rss_errors + hn_errors),
+            "sample_titles": [x.get("title") for x in (rss_items + hn_items)[:5]],
+        },
+    )
 
 
 # ---------------- S3 config (agents/allowlists) ----------------
+
 
 def _s3_get_json(bucket: str, key: str) -> dict:
     try:
@@ -476,6 +526,7 @@ def _effective_allowlists() -> Tuple[List[str], List[str]]:
 
 # ---------------- Weather (Open-Meteo) ----------------
 
+
 def geocode_location(location: str) -> dict:
     base = "https://geocoding-api.open-meteo.com/v1/search"
     safe_location = location.strip()
@@ -510,35 +561,40 @@ def fetch_weather(lat: float, lon: float) -> dict:
         "longitude": lon,
         "timezone": "auto",
         "forecast_days": 7,
-        "current": ",".join([
-            "temperature_2m",
-            "apparent_temperature",
-            "relative_humidity_2m",
-            "precipitation",
-            "rain",
-            "showers",
-            "snowfall",
-            "cloud_cover",
-            "wind_speed_10m",
-            "wind_direction_10m",
-            "weather_code",
-        ]),
-        "daily": ",".join([
-            "weather_code",
-            "temperature_2m_max",
-            "temperature_2m_min",
-            "precipitation_sum",
-            "rain_sum",
-            "snowfall_sum",
-            "precipitation_probability_max",
-            "wind_speed_10m_max",
-        ]),
+        "current": ",".join(
+            [
+                "temperature_2m",
+                "apparent_temperature",
+                "relative_humidity_2m",
+                "precipitation",
+                "rain",
+                "showers",
+                "snowfall",
+                "cloud_cover",
+                "wind_speed_10m",
+                "wind_direction_10m",
+                "weather_code",
+            ]
+        ),
+        "daily": ",".join(
+            [
+                "weather_code",
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "precipitation_sum",
+                "rain_sum",
+                "snowfall_sum",
+                "precipitation_probability_max",
+                "wind_speed_10m_max",
+            ]
+        ),
     }
     url = f"{base}?{urllib.parse.urlencode(params)}"
     return _http_get_json(url, timeout_sec=8)
 
 
 # ---------------- OpenAI (Travel via HTTP) ----------------
+
 
 def _openai_call(prompt: str) -> dict:
     if not OPENAI_API_KEY:
@@ -599,10 +655,8 @@ Return VALID JSON ONLY with this exact structure:
     # total sanity
     try:
         c = data.get("estimated_cost_usd", {})
-        parts = (
-            float(c.get("flights_for_2", 0))
-            + float(c.get("hotel_4_star_5_nights", 0))
-            + float(c.get("local_transport_food", 0))
+        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(
+            c.get("local_transport_food", 0)
         )
         c["total"] = round(parts, 0)
         data["estimated_cost_usd"] = c
@@ -613,6 +667,7 @@ Return VALID JSON ONLY with this exact structure:
 
 
 # ---------------- RAG: Chroma + OpenAI embeddings ----------------
+
 
 def _ensure_openai_sdk():
     global _openai_client
@@ -660,7 +715,7 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
 
     count = 0
     for key in keys:
-        rel = key[len(prefix):].lstrip("/")
+        rel = key[len(prefix) :].lstrip("/")
         dest = os.path.join(local_dir, rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         s3.download_file(bucket, key, dest)
@@ -789,36 +844,46 @@ Excerpts:
 
 # ---------------- Handlers ----------------
 
+
 def _handle_get_health(event: dict) -> dict:
     try:
         import sqlite3 as _s  # uses our shim if present
+
         sqlite_ver = getattr(_s, "sqlite_version", "unknown")
     except Exception:
         sqlite_ver = "unknown"
 
-    return _json_response(event, 200, {
-        "ok": True,
-        "sqlite_version": sqlite_ver,
-        "news_enabled": NEWS_ENABLED,
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "ok": True,
+            "sqlite_version": sqlite_ver,
+            "news_enabled": NEWS_ENABLED,
+        },
+    )
 
 
 def _handle_get_routes(event: dict, method: str, path: str) -> dict:
-    return _json_response(event, 200, {
-        "ok": True,
-        "rawPath": event.get("rawPath"),
-        "normalizedPath": path,
-        "method": method,
-        "routes": [
-            "GET /health",
-            "GET /agents",
-            "POST /agent/run",
-            "POST /runbooks/ask",
-            "GET /news/latest",
-            "GET /_routes",
-            "GET /_debug/news",
-        ],
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "ok": True,
+            "rawPath": event.get("rawPath"),
+            "normalizedPath": path,
+            "method": method,
+            "routes": [
+                "GET /health",
+                "GET /agents",
+                "POST /agent/run",
+                "POST /runbooks/ask",
+                "GET /news/latest",
+                "GET /_routes",
+                "GET /_debug/news",
+            ],
+        },
+    )
 
 
 def _handle_get_agents(event: dict) -> dict:
@@ -885,14 +950,20 @@ def _handle_post_agent_run(event: dict) -> dict:
 
     if agent_id == AGENT_ID_WEATHER:
         if location not in set(weather_locations):
-            return _json_response(event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}})
+            return _json_response(
+                event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}}
+            )
 
         geo = geocode_location(location)
         if geo.get("lat") is None or geo.get("lon") is None:
             return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
+        )
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
@@ -900,7 +971,11 @@ def _handle_post_agent_run(event: dict) -> dict:
             return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
 
         travel = get_travel_info(city)
-        return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
+        return _json_response(
+            event,
+            200,
+            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
+        )
 
     return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
@@ -918,22 +993,27 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
 
-    return _json_response(event, 200, {
-        "question": question,
-        "top_k": top_k,
-        "sources": [
-            {
-                "file": (c.get("meta") or {}).get("file"),
-                "s3_key": (c.get("meta") or {}).get("s3_key"),
-                "chunk": (c.get("meta") or {}).get("chunk"),
-            }
-            for c in contexts
-        ],
-        "answer": answer,
-    })
+    return _json_response(
+        event,
+        200,
+        {
+            "question": question,
+            "top_k": top_k,
+            "sources": [
+                {
+                    "file": (c.get("meta") or {}).get("file"),
+                    "s3_key": (c.get("meta") or {}).get("s3_key"),
+                    "chunk": (c.get("meta") or {}).get("chunk"),
+                }
+                for c in contexts
+            ],
+            "answer": answer,
+        },
+    )
 
 
 # ---------------- Lambda entry ----------------
+
 
 def lambda_handler(event: dict, context: Any) -> dict:
     # top-level guard: never let exceptions bubble to API GW generic 500
@@ -967,7 +1047,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
 
-        return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}})
+        return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path)"}})
 
     except ValueError as e:
         return _json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
