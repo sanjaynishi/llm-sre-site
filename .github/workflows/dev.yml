@@ -88,6 +88,12 @@ jobs:
           TF_VAR_s3_prefix: knowledge/
           TF_VAR_openai_model: gpt-5.2
           TF_VAR_lambda_image_uri: ${{ env.IMAGE_URI }}
+          TF_VAR_vectors_prefix: knowledge/vectors/dev/chroma/
+          TF_VAR_runbooks_prefix: runbooks/
+          run: |
+            set -euo pipefail
+            terraform init -input=false
+            terraform apply -auto-approve -input=false -lock-timeout=5m
         run: |
           set -euo pipefail
           test -n "${TF_VAR_acm_certificate_arn}" || (echo "::error::Missing TF_VAR_acm_certificate_arn" && exit 1)
