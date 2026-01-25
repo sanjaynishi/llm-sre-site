@@ -36,15 +36,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
-#try:
-#    import pysqlite3.dbapi2 as sqlite3  # type: ignore
-
-#    sys.modules["sqlite3"] = sqlite3
-#except Exception:
- #   pass
-
-
-# ---- sqlite shim (must be BEFORE any chromadb import) ----
 try:
     import pysqlite3.dbapi2 as sqlite3
     sys.modules["sqlite3"] = sqlite3
