@@ -4,7 +4,7 @@ lambda/app.py
 Minimal Lambda API for:
   GET  /api/health
   GET  /api/runbooks
-  GET  /api/doc?name=FILE.pdf   (or ?key=full/s3/key.pdf)
+  GET  /api/doc?name=FILE.pdf   (or ?key=full/s3/key.pdf)  -> returns a presigned URL
   GET  /api/agents
   GET  /api/news/latest
   POST /api/runbooks/ask        (Chroma RAG; requires chromadb + pysqlite3-binary + OpenAI)
@@ -24,11 +24,12 @@ import re
 import shutil
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -36,8 +37,8 @@ from botocore.exceptions import ClientError
 # --- sqlite shim for Chroma (Lambda has old sqlite3) ---
 # IMPORTANT: keep this before any potential chromadb/sqlite import.
 try:
-    import pysqlite3  # provided by pysqlite3-binary
-    sys.modules["sqlite3"] = pysqlite3
+    import pysqlite3.dbapi2 as sqlite3  # provided by pysqlite3-binary
+    sys.modules["sqlite3"] = sqlite3
 except Exception:
     # If this fails, Chroma may fail later with sqlite version error
     pass
@@ -66,6 +67,7 @@ CHROMA_LOCAL_DIR = "/tmp/chroma_store"
 # =====================
 # AI News config (free)
 # =====================
+NEWS_ENABLED = os.environ.get("NEWS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
 NEWS_MAX_ITEMS = int(os.environ.get("NEWS_MAX_ITEMS", "18"))
 NEWS_DAYS_BACK = int(os.environ.get("NEWS_DAYS_BACK", "7"))
 NEWS_CACHE_TTL_SEC = int(os.environ.get("NEWS_CACHE_TTL_SEC", str(6 * 60 * 60)))
@@ -78,7 +80,6 @@ RSS_SOURCES = [
     ("Microsoft Foundry", "https://devblogs.microsoft.com/foundry/feed/", "Enterprise"),
     ("Anthropic", "https://www.anthropic.com/news/rss.xml", "Official"),
 ]
-
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
 
 AI_KEYWORDS = [
@@ -87,7 +88,7 @@ AI_KEYWORDS = [
     "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
 ]
 
-# Calm / etheric guardrails: drop overly-hype phrasing
+# Calm guardrails: drop overly-hype phrasing
 DROP_PATTERNS = [
     r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
     r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b",
@@ -110,16 +111,17 @@ def _pick_origin(event: dict) -> str:
     return headers.get("origin") or headers.get("Origin") or "*"
 
 def _response(event: dict, status: int, body: dict) -> dict:
+    # Always valid JSON response (avoid API GW generic 500)
     return {
-        "statusCode": status,
+        "statusCode": int(status),
         "headers": {
-            "content-type": "application/json",
-            "access-control-allow-origin": "*",  # or _pick_origin(event)
-            "access-control-allow-methods": "GET,POST,OPTIONS",
-            "access-control-allow-headers": "Content-Type,Authorization",
-            "vary": "Origin",
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",  # or _pick_origin(event) if you want strict allowlist
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Vary": "Origin",
         },
-        "body": json.dumps(body),
+        "body": json.dumps(body, default=str),
     }
 
 def _get_method(event: dict) -> str:
@@ -131,8 +133,9 @@ def _get_method(event: dict) -> str:
 
 def _get_path(event: dict) -> str:
     path = event.get("rawPath") or event.get("path") or "/"
+    # Normalize CloudFront /api/* -> strip "/api"
     if path.startswith("/api/"):
-        path = path[4:]  # remove "/api"
+        path = path[4:]
     return path
 
 def _get_qs(event: dict) -> dict:
@@ -144,14 +147,15 @@ def _get_body_json(event: dict) -> dict:
         return {}
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8", errors="replace")
-    return json.loads(body)
-
-def _get_object_text(bucket: str, key: str) -> str:
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return obj["Body"].read().decode("utf-8", errors="replace")
+    try:
+        return json.loads(body)
+    except Exception as e:
+        raise ValueError(f"Invalid JSON body: {e}") from e
 
 def _get_object_json(bucket: str, key: str) -> dict:
-    return json.loads(_get_object_text(bucket, key))
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read().decode("utf-8", errors="replace")
+    return json.loads(raw)
 
 def _list_prefix(bucket: str, prefix: str) -> List[dict]:
     out: List[dict] = []
@@ -187,9 +191,26 @@ def _download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
         count += 1
     return count
 
+def _presign(bucket: str, key: str, expires: int = 300) -> str:
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=int(expires),
+    )
+
 # =====================
 # AI News helpers
 # =====================
+
+_DEFAULT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 aimlsre-news/1.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "close",
+}
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
@@ -208,9 +229,16 @@ def _relevant(text: str) -> bool:
     return True
 
 def _http_get_text(url: str, timeout_sec: int = 12) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "aimlsre-news/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+    req = urllib.request.Request(url, headers=_DEFAULT_HTTP_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:600] + "...") if len(detail) > 600 else detail
+        raise RuntimeError(f"HTTP {e.code} GET {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error GET {url} :: {e}") from e
 
 def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
     return json.loads(_http_get_text(url, timeout_sec=timeout_sec))
@@ -239,7 +267,6 @@ def _parse_rss(xml_text: str, source: str, tag: str) -> List[dict]:
         published_at = None
         pub = (it.findtext("pubDate") or "").strip()
         if pub:
-            # Best-effort parse; feeds vary
             parsed = None
             for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z"):
                 try:
@@ -280,24 +307,30 @@ def _dedupe_sort(items: List[dict]) -> List[dict]:
     return uniq[:NEWS_MAX_ITEMS]
 
 def _get_ai_news_payload() -> dict:
+    if not NEWS_ENABLED:
+        return {"updatedAt": _now_iso(), "items": [], "disabled": True}
+
     now = time.time()
     if _news_cache["payload"] is not None and (now - _news_cache["ts"] < NEWS_CACHE_TTL_SEC):
         return _news_cache["payload"]
 
     items: List[dict] = []
+    errors: List[dict] = []
 
-    # RSS sources
     for name, url, tag in RSS_SOURCES:
         try:
             xml_text = _http_get_text(url, timeout_sec=12)
             items.extend(_parse_rss(xml_text, name, tag))
-        except Exception:
-            continue
+        except Exception as e:
+            errors.append({"source": name, "url": url, "error": str(e)[:300]})
 
-    # HN community signal via Algolia (no key)
     try:
-        q = urllib.parse.quote("AI OR LLM OR OpenAI OR Anthropic OR Claude OR Gemini OR DeepMind OR Mistral OR RAG OR agentic")
+        q = urllib.parse.quote(
+            "AI OR LLM OR OpenAI OR Anthropic OR Claude OR Gemini OR DeepMind OR Mistral OR RAG OR agentic"
+        )
         data = _http_get_json(HN_ALGOLIA.format(q=q), timeout_sec=10)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+
         for h in (data.get("hits") or [])[:25]:
             title = (h.get("title") or "").strip()
             link = (h.get("url") or "").strip()
@@ -311,7 +344,6 @@ def _get_ai_news_payload() -> dict:
             if created:
                 try:
                     dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
                     if dt < cutoff:
                         continue
                     published_at = dt.astimezone().isoformat()
@@ -327,10 +359,10 @@ def _get_ai_news_payload() -> dict:
                 "tag": "Community Signal",
                 "publishedAt": published_at,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append({"source": "Hacker News", "url": "hn.algolia.com", "error": str(e)[:300]})
 
-    payload = {"updatedAt": _now_iso(), "items": _dedupe_sort(items)}
+    payload = {"updatedAt": _now_iso(), "items": _dedupe_sort(items), "errors": errors[:20]}
     _news_cache["ts"] = now
     _news_cache["payload"] = payload
     return payload
@@ -346,15 +378,12 @@ def _ensure_openai():
     global _openai_client
     if _openai_client is not None:
         return _openai_client
-
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not configured")
-
     try:
         from openai import OpenAI  # type: ignore
     except Exception as e:
         raise RuntimeError(f"OpenAI SDK not installed. Import error: {e}") from e
-
     _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
@@ -369,7 +398,6 @@ def _ensure_chroma():
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
     vectors_prefix = _s3_key(VECTORS_PREFIX)
-
     _download_prefix(S3_BUCKET, vectors_prefix, CHROMA_LOCAL_DIR)
 
     try:
@@ -382,7 +410,8 @@ def _ensure_chroma():
         path=CHROMA_LOCAL_DIR,
         settings=Settings(anonymized_telemetry=False),
     )
-    _chroma_collection = client.get_collection(CHROMA_COLLECTION)
+    # get_collection will throw if missing; create if you prefer
+    _chroma_collection = client.get_or_create_collection(CHROMA_COLLECTION)
     _ = _chroma_collection.count()
     return _chroma_collection
 
@@ -405,7 +434,7 @@ def _retrieve(question: str, top_k: int) -> List[dict]:
     metas = (res.get("metadatas") or [[]])[0]
     dists = (res.get("distances") or [[]])[0]
 
-    out = []
+    out: List[dict] = []
     for doc, meta, dist in zip(docs, metas, dists):
         out.append({"text": doc, "meta": meta or {}, "distance": dist})
     return out
@@ -447,39 +476,59 @@ Runbook excerpts:
         max_output_tokens=700,
     )
 
+    # Robust text extraction across SDK variants
     out_text = ""
-    for item in resp.output or []:
-        if getattr(item, "type", None) == "message":
-            for c in item.content or []:
-                if getattr(c, "type", None) in ("output_text", "text"):
-                    out_text += c.text or ""
-    out_text = (out_text or "").strip() or (getattr(resp, "output_text", "") or "").strip()
-    return out_text or "No answer returned."
+    try:
+        ot = getattr(resp, "output_text", None)
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
+    except Exception:
+        pass
+
+    try:
+        for item in (getattr(resp, "output", None) or []):
+            if getattr(item, "type", None) == "message":
+                for c in (getattr(item, "content", None) or []):
+                    if getattr(c, "type", None) in ("output_text", "text"):
+                        out_text += (getattr(c, "text", None) or "")
+    except Exception:
+        pass
+
+    return (out_text or "").strip() or "No answer returned."
 
 # =====================
 # Lambda handler
 # =====================
 
-def lambda_handler(event, context):
-    if _get_method(event) == "OPTIONS":
-        return _response(event, 200, {"ok": True})
-
-    method = _get_method(event)
-    path = _get_path(event)
-
+def lambda_handler(event: dict, context: Any) -> dict:
+    # Never let exceptions bubble to API GW generic 500
     try:
+        method = _get_method(event)
+        path = _get_path(event)
+
+        if method == "OPTIONS":
+            return _response(event, 200, {"ok": True})
+
         # -----------------
         # Health check
         # -----------------
         if path == "/health" and method == "GET":
+            try:
+                import sqlite3 as _s
+                sqlite_ver = getattr(_s, "sqlite_version", "unknown")
+            except Exception:
+                sqlite_ver = "unknown"
+
             return _response(event, 200, {
                 "ok": True,
+                "sqlite_version": sqlite_ver,
                 "bucket": S3_BUCKET,
                 "prefix": S3_PREFIX,
                 "runbooks_prefix": _s3_key(RUNBOOKS_PREFIX),
                 "vectors_prefix": _s3_key(VECTORS_PREFIX),
                 "chroma_collection": CHROMA_COLLECTION,
                 "embed_model": EMBED_MODEL,
+                "news_enabled": NEWS_ENABLED,
             })
 
         # -----------------
@@ -508,18 +557,18 @@ def lambda_handler(event, context):
                         "name": key.split("/")[-1],
                         "key": key,
                         "size": obj.get("Size", 0),
-                        "last_modified": obj["LastModified"].isoformat() if obj.get("LastModified") else None
+                        "last_modified": obj["LastModified"].isoformat() if obj.get("LastModified") else None,
                     })
 
-            runbooks.sort(key=lambda x: (x["name"] or "").lower())
+            runbooks.sort(key=lambda x: (x.get("name") or "").lower())
             return _response(event, 200, {
                 "bucket": S3_BUCKET,
                 "prefix": prefix,
-                "runbooks": runbooks
+                "runbooks": runbooks,
             })
 
         # -----------------
-        # Get runbook content (text only)
+        # Get runbook doc (presigned URL)
         # GET /doc?name=FILE.pdf  OR /doc?key=full/s3/key.pdf
         # -----------------
         if path == "/doc" and method == "GET":
@@ -527,24 +576,22 @@ def lambda_handler(event, context):
                 return _response(event, 500, {"error": "S3_BUCKET not set"})
 
             qs = _get_qs(event)
+            key = (qs.get("key") or "").strip()
+            name = (qs.get("name") or "").strip()
 
-            if "key" in qs and qs["key"]:
-                key = qs["key"]
-                content = _get_object_text(S3_BUCKET, key)
-                return _response(event, 200, {"key": key, "content": content})
+            if key:
+                url = _presign(S3_BUCKET, key, expires=300)
+                return _response(event, 200, {"key": key, "url": url})
 
-            if "name" in qs and qs["name"]:
-                filename = qs["name"]
+            if name:
                 prefix = _s3_key(RUNBOOKS_PREFIX)
                 objs = _list_prefix(S3_BUCKET, prefix)
-
                 for obj in objs:
-                    key = obj.get("Key", "")
-                    if key.endswith("/" + filename) or key.endswith(filename):
-                        content = _get_object_text(S3_BUCKET, key)
-                        return _response(event, 200, {"key": key, "content": content})
-
-                return _response(event, 404, {"error": f"Runbook not found: {filename}"})
+                    k = obj.get("Key", "")
+                    if k.endswith("/" + name) or k.endswith(name):
+                        url = _presign(S3_BUCKET, k, expires=300)
+                        return _response(event, 200, {"key": k, "url": url})
+                return _response(event, 404, {"error": f"Runbook not found: {name}"})
 
             return _response(event, 400, {"error": "Provide ?name=<file.pdf> or ?key=<s3-key>"})
 
@@ -591,12 +638,17 @@ def lambda_handler(event, context):
                 "answer": ans,
             })
 
-        return _response(event, 404, {"error": f"Route not found: {method} {path}"})
+        # -----------------
+        # Not found
+        # -----------------
+        return _response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {method} {path}"}})
 
+    except ValueError as e:
+        return _response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
     except ClientError as e:
-        return _response(event, 500, {"error": "AWS error", "detail": str(e)})
+        return _response(event, 500, {"error": {"code": "AWS_ERROR", "message": str(e)}})
     except Exception as e:
-        return _response(event, 500, {"error": "Unhandled error", "detail": str(e)})
+        return _response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
 
 # Backward-compatible alias if anything is still configured as "app.handler"
 handler = lambda_handler

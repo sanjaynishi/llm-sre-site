@@ -43,6 +43,7 @@ try:
 
     sys.modules["sqlite3"] = sqlite3
 except Exception:
+    # If shim isn't available, chromadb import will fail later (and we surface a clear error).
     pass
 
 # ---- disable Chroma telemetry ----
@@ -93,11 +94,10 @@ _openai_client = None
 _chroma_client = None
 _chroma_collection = None
 
+
 # ---------------- Basic helpers ----------------
 
-
 def _log(msg: str) -> None:
-    # Keep it simple; shows up in CloudWatch Logs
     print(msg)
 
 
@@ -117,10 +117,7 @@ def _pick_cors_origin(event: dict) -> str:
 
 
 def _json_response(event: dict, status_code: int, body: dict, extra_headers: dict | None = None) -> dict:
-    # CRITICAL: Always return a valid Lambda Proxy response (HTTP API v2).
-    # Use default=str so datetime/objects never break json.dumps.
     cors_origin = _pick_cors_origin(event)
-
     headers = {
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": str(cors_origin),
@@ -167,8 +164,6 @@ def _get_body_json(event: dict) -> dict:
 
 # ---------------- HTTP helpers (stdlib) ----------------
 
-# Some RSS providers block "generic bots" or require Accept headers.
-# These defaults reduce 403s and other blocks.
 _DEFAULT_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -184,7 +179,6 @@ def _http_get_text(url: str, timeout_sec: int = 8) -> str:
     req = urllib.request.Request(url, headers=_DEFAULT_HTTP_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            # Some feeds are gzip; urllib typically handles it, but decode safely.
             return resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
@@ -202,7 +196,6 @@ def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
 def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req_headers = {"Content-Type": "application/json"}
-    # Use the same "browser-ish" defaults plus caller headers
     req_headers.update(_DEFAULT_HTTP_HEADERS)
     if headers:
         req_headers.update(headers)
@@ -247,37 +240,13 @@ RSS_SOURCES = [
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
 
 AI_KEYWORDS = [
-    "ai",
-    "llm",
-    "openai",
-    "gpt",
-    "claude",
-    "anthropic",
-    "gemini",
-    "deepmind",
-    "mistral",
-    "hugging face",
-    "transformer",
-    "rag",
-    "agentic",
-    "multimodal",
-    "inference",
-    "alignment",
-    "safety",
-    "eval",
-    "evals",
-    "rlhf",
-    "prompt",
+    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
+    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
+    "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
 ]
 DROP_PATTERNS = [
-    r"\bdoom\b",
-    r"\bpanic\b",
-    r"\bdestroy\b",
-    r"\bapocalypse\b",
-    r"\bterrifying\b",
-    r"\breplaces all jobs\b",
-    r"\bend of\b",
-    r"\bsingularity\b",
+    r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
+    r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b",
 ]
 
 _news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
@@ -316,7 +285,41 @@ def _dedupe(items: List[dict]) -> List[dict]:
 
 
 def _sort(items: List[dict]) -> List[dict]:
-    return sorted(items, key=lambda it: (it.get("publishedAt") or ""), reverse=True)
+    # Keep items with missing dates, but push them later.
+    def _k(it: dict) -> str:
+        return (it.get("publishedAt") or "")
+    return sorted(items, key=_k, reverse=True)
+
+
+def _parse_rss_date(pub: str) -> str | None:
+    pub = (pub or "").strip()
+    if not pub:
+        return None
+
+    # Common RSS formats (best-effort, never raise)
+    fmts = [
+        "%a, %d %b %Y %H:%M:%S %Z",      # RFC822 with TZ name
+        "%a, %d %b %Y %H:%M:%S %z",      # RFC822 with numeric tz
+        "%Y-%m-%dT%H:%M:%S%z",           # ISO-ish
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",             # naive ISO
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(pub, f)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone().isoformat()
+        except Exception:
+            continue
+
+    # Some feeds provide "Z"
+    try:
+        dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+        return dt.astimezone().isoformat()
+    except Exception:
+        return None
 
 
 def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
@@ -343,14 +346,17 @@ def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
         published_at = None
         pub = (it.findtext("pubDate") or "").strip()
         if pub:
-            # Best effort parse; never crash news endpoint
-            try:
-                dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
-                if dt < cutoff:
-                    continue
-                published_at = dt.astimezone().isoformat()
-            except Exception:
-                published_at = None
+            iso = _parse_rss_date(pub)
+            if iso:
+                try:
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt < cutoff:
+                        continue
+                    published_at = dt.astimezone().isoformat()
+                except Exception:
+                    published_at = iso  # still keep it
 
         items.append(
             {
@@ -403,6 +409,8 @@ def _fetch_hn_items_with_errors() -> Tuple[List[dict], List[dict]]:
             if created:
                 try:
                     dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
                     if dt < cutoff:
                         continue
                     published_at = dt.astimezone().isoformat()
@@ -442,7 +450,7 @@ def _handle_get_news_latest(event: dict) -> dict:
     payload = {
         "updatedAt": _now_iso(),
         "items": items,
-        # Include errors so you can see if outbound is blocked (VPC/NAT/DNS) or feed blocks with 403.
+        # keep errors for visibility; never crash the endpoint
         "errors": (rss_errors + hn_errors)[:20],
     }
     _news_cache["ts"] = now
@@ -451,7 +459,6 @@ def _handle_get_news_latest(event: dict) -> dict:
 
 
 def _handle_get_debug_news(event: dict) -> dict:
-    # Force fetch + return errors, no cache
     rss_items, rss_errors = _fetch_rss_items_with_errors()
     hn_items, hn_errors = _fetch_hn_items_with_errors()
     return _json_response(
@@ -469,7 +476,6 @@ def _handle_get_debug_news(event: dict) -> dict:
 
 
 # ---------------- S3 config (agents/allowlists) ----------------
-
 
 def _s3_get_json(bucket: str, key: str) -> dict:
     try:
@@ -525,7 +531,6 @@ def _effective_allowlists() -> Tuple[List[str], List[str]]:
 
 
 # ---------------- Weather (Open-Meteo) ----------------
-
 
 def geocode_location(location: str) -> dict:
     base = "https://geocoding-api.open-meteo.com/v1/search"
@@ -595,7 +600,6 @@ def fetch_weather(lat: float, lon: float) -> dict:
 
 # ---------------- OpenAI (Travel via HTTP) ----------------
 
-
 def _openai_call(prompt: str) -> dict:
     if not OPENAI_API_KEY:
         return {"error": {"message": "OPENAI_API_KEY not configured"}}
@@ -655,8 +659,10 @@ Return VALID JSON ONLY with this exact structure:
     # total sanity
     try:
         c = data.get("estimated_cost_usd", {})
-        parts = float(c.get("flights_for_2", 0)) + float(c.get("hotel_4_star_5_nights", 0)) + float(
-            c.get("local_transport_food", 0)
+        parts = (
+            float(c.get("flights_for_2", 0))
+            + float(c.get("hotel_4_star_5_nights", 0))
+            + float(c.get("local_transport_food", 0))
         )
         c["total"] = round(parts, 0)
         data["estimated_cost_usd"] = c
@@ -667,7 +673,6 @@ Return VALID JSON ONLY with this exact structure:
 
 
 # ---------------- RAG: Chroma + OpenAI embeddings ----------------
-
 
 def _ensure_openai_sdk():
     global _openai_client
@@ -757,26 +762,6 @@ def _embed_text(text: str) -> List[float]:
     return emb.data[0].embedding
 
 
-def _retrieve_chunks(question: str, top_k: int) -> List[Dict[str, Any]]:
-    col = _ensure_chroma()
-    q_emb = _embed_text(question)
-
-    res = col.query(
-        query_embeddings=[q_emb],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
-    dists = (res.get("distances") or [[]])[0]
-
-    out: List[Dict[str, Any]] = []
-    for doc, meta, dist in zip(docs, metas, dists):
-        out.append({"text": doc, "meta": meta, "distance": dist})
-    return out
-
-
 def _response_text_from_openai_response(resp: Any) -> str:
     try:
         ot = getattr(resp, "output_text", None)
@@ -800,6 +785,26 @@ def _response_text_from_openai_response(resp: Any) -> str:
         pass
 
     return (text or "").strip()
+
+
+def _retrieve_chunks(question: str, top_k: int) -> List[Dict[str, Any]]:
+    col = _ensure_chroma()
+    q_emb = _embed_text(question)
+
+    res = col.query(
+        query_embeddings=[q_emb],
+        n_results=top_k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
+
+    out: List[Dict[str, Any]] = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        out.append({"text": doc, "meta": meta, "distance": dist})
+    return out
 
 
 def _answer_with_llm(question: str, contexts: List[Dict[str, Any]]) -> str:
@@ -844,11 +849,9 @@ Excerpts:
 
 # ---------------- Handlers ----------------
 
-
 def _handle_get_health(event: dict) -> dict:
     try:
         import sqlite3 as _s  # uses our shim if present
-
         sqlite_ver = getattr(_s, "sqlite_version", "unknown")
     except Exception:
         sqlite_ver = "unknown"
@@ -856,11 +859,7 @@ def _handle_get_health(event: dict) -> dict:
     return _json_response(
         event,
         200,
-        {
-            "ok": True,
-            "sqlite_version": sqlite_ver,
-            "news_enabled": NEWS_ENABLED,
-        },
+        {"ok": True, "sqlite_version": sqlite_ver, "news_enabled": NEWS_ENABLED},
     )
 
 
@@ -959,11 +958,7 @@ def _handle_post_agent_run(event: dict) -> dict:
             return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return _json_response(
-            event,
-            200,
-            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
-        )
+        return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
@@ -971,11 +966,7 @@ def _handle_post_agent_run(event: dict) -> dict:
             return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
 
         travel = get_travel_info(city)
-        return _json_response(
-            event,
-            200,
-            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
-        )
+        return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
 
     return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
@@ -1014,9 +1005,7 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
 
 # ---------------- Lambda entry ----------------
 
-
 def lambda_handler(event: dict, context: Any) -> dict:
-    # top-level guard: never let exceptions bubble to API GW generic 500
     try:
         method = _get_method(event)
         path = _get_path(event)
@@ -1047,12 +1036,16 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
 
-        return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path)"}})
+        # ✅ FIXED: correct f-string + braces
+        return _json_response(
+            event,
+            404,
+            {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}},
+        )
 
     except ValueError as e:
         return _json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
     except Exception as e:
-        # This is the key: stop API GW from returning {"message":"Internal Server Error"}
         return _json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
 
 
