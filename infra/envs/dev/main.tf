@@ -42,6 +42,7 @@ module "agent_api" {
 
   env        = var.env
   aws_region = var.aws_region
+  region      = var.region   # ✅ ADD THIS
 
   name_prefix = var.name_prefix
 
