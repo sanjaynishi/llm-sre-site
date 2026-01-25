@@ -3,6 +3,11 @@
 variable "env" { type = string }
 variable "aws_region" { type = string }
 
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
 variable "name_prefix" {
   type    = string
   default = "llm-sre"

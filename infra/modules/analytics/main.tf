@@ -12,11 +12,14 @@ terraform {
 locals {
   bucket_name = "${var.name_prefix}-analytics-${var.aws_account_id}"
 
-  # S3 STANDARD_IA requires transition >= 30 days.
-  # Also expiration days must be > transition days.
-  do_transition   = var.retention_days >= 31
-  transition_days = 30
-  expiration_days = var.retention_days
+  # S3 constraint for STANDARD_IA: transition days must be >= 30
+  # Also, expiration must be > transition
+  transition_days = max(30, var.retention_days)
+  expiration_days = max(var.retention_days + 1, local.transition_days + 1)
+
+  # AWS-published canonical ID for awslogsdelivery (CloudFront standard logs writer)
+  # Source: CloudFront standard logging docs
+  awslogsdelivery_canonical_id = "c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0"
 }
 
 resource "aws_s3_bucket" "analytics" {
@@ -31,7 +34,7 @@ resource "aws_s3_bucket_public_access_block" "analytics" {
   restrict_public_buckets = true
 }
 
-# CloudFront legacy standard logs require ACLs to be enabled on the target bucket.
+# CloudFront standard logs REQUIRE ACLs to be enabled (NOT BucketOwnerEnforced)
 resource "aws_s3_bucket_ownership_controls" "analytics" {
   bucket = aws_s3_bucket.analytics.id
   rule {
@@ -39,7 +42,7 @@ resource "aws_s3_bucket_ownership_controls" "analytics" {
   }
 }
 
-# Explicit ACL policy with LogDelivery group grants
+# Enable ACL capability + explicitly grant awslogsdelivery FULL_CONTROL
 resource "aws_s3_bucket_acl" "analytics" {
   bucket = aws_s3_bucket.analytics.id
 
@@ -48,15 +51,7 @@ resource "aws_s3_bucket_acl" "analytics" {
       id = data.aws_canonical_user_id.current.id
     }
 
-    grant {
-      grantee {
-        type = "CanonicalUser"
-        id   = data.aws_canonical_user_id.current.id
-      }
-      permission = "FULL_CONTROL"
-    }
-
-    # S3 Log Delivery group (used for delivery of access logs)
+    # Keep S3 LogDelivery group if you want (harmless)
     grant {
       grantee {
         type = "Group"
@@ -71,6 +66,15 @@ resource "aws_s3_bucket_acl" "analytics" {
         uri  = "http://acs.amazonaws.com/groups/s3/LogDelivery"
       }
       permission = "READ_ACP"
+    }
+
+    # ✅ REQUIRED: awslogsdelivery (CloudFront standard logs writer)
+    grant {
+      grantee {
+        type = "CanonicalUser"
+        id   = local.awslogsdelivery_canonical_id
+      }
+      permission = "FULL_CONTROL"
     }
   }
 
@@ -91,6 +95,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "analytics" {
   }
 }
 
+# ✅ Guard rails: expire raw logs; keep rollups longer
 resource "aws_s3_bucket_lifecycle_configuration" "analytics" {
   bucket = aws_s3_bucket.analytics.id
 
@@ -99,15 +104,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "analytics" {
     status = "Enabled"
     filter { prefix = "cloudfront/" }
 
-    dynamic "transition" {
-      for_each = local.do_transition ? [1] : []
-      content {
-        days          = local.transition_days
-        storage_class = "STANDARD_IA"
-      }
+    transition {
+      days          = local.transition_days
+      storage_class = "STANDARD_IA"
     }
 
-    expiration { days = local.expiration_days }
+    expiration {
+      days = local.expiration_days
+    }
   }
 
   rule {
@@ -115,15 +119,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "analytics" {
     status = "Enabled"
     filter { prefix = "apigw/" }
 
-    dynamic "transition" {
-      for_each = local.do_transition ? [1] : []
-      content {
-        days          = local.transition_days
-        storage_class = "STANDARD_IA"
-      }
+    transition {
+      days          = local.transition_days
+      storage_class = "STANDARD_IA"
     }
 
-    expiration { days = local.expiration_days }
+    expiration {
+      days = local.expiration_days
+    }
   }
 
   rule {
@@ -136,14 +139,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "analytics" {
       storage_class = "STANDARD_IA"
     }
 
-    expiration { days = 730 }
+    expiration {
+      days = 730
+    }
   }
 }
 
-# Optional: if you still want your bucket policy gate
+# Bucket policy (optional) – keep if you want extra guardrails; CloudFront relies on ACLs
 data "aws_iam_policy_document" "allow_cloudfront_logs" {
-  count = var.enable_cloudfront_log_write ? 1 : 0
-
   statement {
     sid    = "AWSLogDeliveryWrite"
     effect = "Allow"
@@ -180,5 +183,5 @@ data "aws_iam_policy_document" "allow_cloudfront_logs" {
 resource "aws_s3_bucket_policy" "analytics" {
   count  = var.enable_cloudfront_log_write ? 1 : 0
   bucket = aws_s3_bucket.analytics.id
-  policy = data.aws_iam_policy_document.allow_cloudfront_logs[0].json
+  policy = data.aws_iam_policy_document.allow_cloudfront_logs.json
 }

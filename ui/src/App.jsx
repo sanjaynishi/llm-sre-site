@@ -2,6 +2,7 @@ import React, { useMemo, useState } from "react";
 import Runbook from "./pages/Runbooks";
 import Rag from "./pages/Rag";
 import Agents from "./pages/Agents";
+import AiNews from "./pages/AiNews"; // ✅ ADD
 
 const appWrap = { minHeight: "100vh", background: "#f3f4f6" };
 
@@ -78,9 +79,10 @@ const contentCard = {
 export default function App() {
   const tabs = useMemo(
     () => [
-      { key: "runbook", label: "Runbooks" }, // predefined dropdown
-      { key: "rag", label: "RAG" },          // free-text AskRunbooks
+      { key: "runbook", label: "Runbooks" },   // predefined dropdown
+      { key: "rag", label: "RAG Chat" },       // ✅ renamed already
       { key: "agents", label: "Agentic AI" },
+      { key: "aiNews", label: "AI News" },     // ✅ ADD
     ],
     []
   );
@@ -94,7 +96,7 @@ export default function App() {
           <div>
             <h1 style={title}>AIML LLM SRE / DevOps</h1>
             <p style={subtitle}>
-              Runbooks (predefined), RAG (ask anything), and Agentic AI utilities.
+              Runbooks (predefined), RAG Chat (ask anything), Agentic AI utilities, and curated AI News.
             </p>
           </div>
         </div>
@@ -116,6 +118,7 @@ export default function App() {
           {active === "runbook" && <Runbook />}
           {active === "rag" && <Rag />}
           {active === "agents" && <Agents />}
+          {active === "aiNews" && <AiNews />} {/* ✅ ADD */}
         </div>
       </div>
     </div>

@@ -6,11 +6,13 @@ Minimal Lambda API for:
   GET  /api/runbooks
   GET  /api/doc?name=FILE.pdf   (or ?key=full/s3/key.pdf)
   GET  /api/agents
+  GET  /api/news/latest
   POST /api/runbooks/ask        (Chroma RAG; requires chromadb + pysqlite3-binary + OpenAI)
 
 Notes:
 - CloudFront routes /api/* to API Gateway; this handler normalizes "/api" away.
 - Includes sqlite shim for Chroma (Lambda base sqlite is too old).
+- AI News uses free sources (RSS + HN Algolia). No registration/API keys.
 """
 
 from __future__ import annotations
@@ -18,8 +20,14 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List
 
 import boto3
@@ -56,6 +64,38 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2").strip()
 CHROMA_LOCAL_DIR = "/tmp/chroma_store"
 
 # =====================
+# AI News config (free)
+# =====================
+NEWS_MAX_ITEMS = int(os.environ.get("NEWS_MAX_ITEMS", "18"))
+NEWS_DAYS_BACK = int(os.environ.get("NEWS_DAYS_BACK", "7"))
+NEWS_CACHE_TTL_SEC = int(os.environ.get("NEWS_CACHE_TTL_SEC", str(6 * 60 * 60)))
+
+RSS_SOURCES = [
+    ("OpenAI", "https://openai.com/news/rss.xml", "Official"),
+    ("DeepMind", "https://deepmind.google/blog/feed/basic", "Research"),
+    ("Hugging Face", "https://huggingface.co/blog/feed.xml", "Open Source"),
+    ("AWS ML Blog", "https://aws.amazon.com/blogs/machine-learning/feed/", "MLOps"),
+    ("Microsoft Foundry", "https://devblogs.microsoft.com/foundry/feed/", "Enterprise"),
+    ("Anthropic", "https://www.anthropic.com/news/rss.xml", "Official"),
+]
+
+HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
+
+AI_KEYWORDS = [
+    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
+    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
+    "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
+]
+
+# Calm / etheric guardrails: drop overly-hype phrasing
+DROP_PATTERNS = [
+    r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
+    r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b",
+]
+
+_news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
+
+# =====================
 # Helpers
 # =====================
 
@@ -65,13 +105,9 @@ def _s3_key(path: str) -> str:
         return path.lstrip("/")
     return f"{S3_PREFIX.rstrip('/')}/{path.lstrip('/')}"
 
-
 def _pick_origin(event: dict) -> str:
-    # Keep it permissive for now (your CloudFront already controls origins).
-    # If you want strict allowlist later, plug it in here.
     headers = event.get("headers") or {}
     return headers.get("origin") or headers.get("Origin") or "*"
-
 
 def _response(event: dict, status: int, body: dict) -> dict:
     return {
@@ -86,7 +122,6 @@ def _response(event: dict, status: int, body: dict) -> dict:
         "body": json.dumps(body),
     }
 
-
 def _get_method(event: dict) -> str:
     return (
         event.get("requestContext", {}).get("http", {}).get("method")
@@ -94,18 +129,14 @@ def _get_method(event: dict) -> str:
         or "GET"
     ).upper()
 
-
 def _get_path(event: dict) -> str:
-    # HTTP API v2 uses rawPath. CloudFront sends /api/* to API GW.
     path = event.get("rawPath") or event.get("path") or "/"
     if path.startswith("/api/"):
         path = path[4:]  # remove "/api"
     return path
 
-
 def _get_qs(event: dict) -> dict:
     return event.get("queryStringParameters") or {}
-
 
 def _get_body_json(event: dict) -> dict:
     body = event.get("body") or ""
@@ -115,18 +146,14 @@ def _get_body_json(event: dict) -> dict:
         body = base64.b64decode(body).decode("utf-8", errors="replace")
     return json.loads(body)
 
-
 def _get_object_text(bucket: str, key: str) -> str:
     obj = s3.get_object(Bucket=bucket, Key=key)
     return obj["Body"].read().decode("utf-8", errors="replace")
 
-
 def _get_object_json(bucket: str, key: str) -> dict:
     return json.loads(_get_object_text(bucket, key))
 
-
 def _list_prefix(bucket: str, prefix: str) -> List[dict]:
-    """List all objects under prefix (handles pagination)."""
     out: List[dict] = []
     token = None
     while True:
@@ -141,9 +168,7 @@ def _list_prefix(bucket: str, prefix: str) -> List[dict]:
             break
     return out
 
-
 def _download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
-    """Download all objects under s3://bucket/prefix -> local_dir."""
     objs = _list_prefix(bucket, prefix)
     keys = [o["Key"] for o in objs if o.get("Key") and not o["Key"].endswith("/")]
     if not keys:
@@ -162,6 +187,153 @@ def _download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
         count += 1
     return count
 
+# =====================
+# AI News helpers
+# =====================
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+def _strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]*>", "", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _relevant(text: str) -> bool:
+    t = (text or "").lower()
+    if not any(k in t for k in AI_KEYWORDS):
+        return False
+    if any(re.search(p, t) for p in DROP_PATTERNS):
+        return False
+    return True
+
+def _http_get_text(url: str, timeout_sec: int = 12) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "aimlsre-news/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
+    return json.loads(_http_get_text(url, timeout_sec=timeout_sec))
+
+def _parse_rss(xml_text: str, source: str, tag: str) -> List[dict]:
+    items: List[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return items
+
+    for it in root.findall(".//item"):
+        title = _strip_html((it.findtext("title") or "").strip())
+        link = (it.findtext("link") or "").strip()
+        desc = _strip_html((it.findtext("description") or "").strip())
+
+        if not title or not link:
+            continue
+
+        blob = f"{title} {desc}"
+        if not _relevant(blob):
+            continue
+
+        published_at = None
+        pub = (it.findtext("pubDate") or "").strip()
+        if pub:
+            # Best-effort parse; feeds vary
+            parsed = None
+            for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z"):
+                try:
+                    parsed = datetime.strptime(pub, fmt)
+                    break
+                except Exception:
+                    continue
+            if parsed:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                dt = parsed.astimezone(timezone.utc)
+                if dt < cutoff:
+                    continue
+                published_at = dt.astimezone().isoformat()
+
+        items.append({
+            "id": link[-16:] if len(link) > 16 else link,
+            "title": title[:180],
+            "url": link,
+            "summary": desc[:260],
+            "source": source,
+            "tag": tag,
+            "publishedAt": published_at,
+        })
+
+    return items
+
+def _dedupe_sort(items: List[dict]) -> List[dict]:
+    seen = set()
+    uniq: List[dict] = []
+    for it in items:
+        u = (it.get("url") or "").strip().lower()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        uniq.append(it)
+    uniq.sort(key=lambda x: x.get("publishedAt") or "", reverse=True)
+    return uniq[:NEWS_MAX_ITEMS]
+
+def _get_ai_news_payload() -> dict:
+    now = time.time()
+    if _news_cache["payload"] is not None and (now - _news_cache["ts"] < NEWS_CACHE_TTL_SEC):
+        return _news_cache["payload"]
+
+    items: List[dict] = []
+
+    # RSS sources
+    for name, url, tag in RSS_SOURCES:
+        try:
+            xml_text = _http_get_text(url, timeout_sec=12)
+            items.extend(_parse_rss(xml_text, name, tag))
+        except Exception:
+            continue
+
+    # HN community signal via Algolia (no key)
+    try:
+        q = urllib.parse.quote("AI OR LLM OR OpenAI OR Anthropic OR Claude OR Gemini OR DeepMind OR Mistral OR RAG OR agentic")
+        data = _http_get_json(HN_ALGOLIA.format(q=q), timeout_sec=10)
+        for h in (data.get("hits") or [])[:25]:
+            title = (h.get("title") or "").strip()
+            link = (h.get("url") or "").strip()
+            created = (h.get("created_at") or "").strip()
+            if not title or not link:
+                continue
+            if not _relevant(title):
+                continue
+
+            published_at = None
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+                    if dt < cutoff:
+                        continue
+                    published_at = dt.astimezone().isoformat()
+                except Exception:
+                    pass
+
+            items.append({
+                "id": link[-16:] if len(link) > 16 else link,
+                "title": title[:180],
+                "url": link,
+                "summary": "",
+                "source": "Hacker News",
+                "tag": "Community Signal",
+                "publishedAt": published_at,
+            })
+    except Exception:
+        pass
+
+    payload = {"updatedAt": _now_iso(), "items": _dedupe_sort(items)}
+    _news_cache["ts"] = now
+    _news_cache["payload"] = payload
+    return payload
 
 # =====================
 # RAG (Chroma + OpenAI)
@@ -169,7 +341,6 @@ def _download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
 
 _chroma_collection = None
 _openai_client = None
-
 
 def _ensure_openai():
     global _openai_client
@@ -187,7 +358,6 @@ def _ensure_openai():
     _openai_client = OpenAI(api_key=OPENAI_API_KEY)
     return _openai_client
 
-
 def _ensure_chroma():
     global _chroma_collection
     if _chroma_collection is not None:
@@ -200,7 +370,6 @@ def _ensure_chroma():
 
     vectors_prefix = _s3_key(VECTORS_PREFIX)
 
-    # Download persisted Chroma store from S3 -> /tmp
     _download_prefix(S3_BUCKET, vectors_prefix, CHROMA_LOCAL_DIR)
 
     try:
@@ -217,12 +386,10 @@ def _ensure_chroma():
     _ = _chroma_collection.count()
     return _chroma_collection
 
-
 def _embed(text: str) -> List[float]:
     client = _ensure_openai()
     emb = client.embeddings.create(model=EMBED_MODEL, input=[text])
     return emb.data[0].embedding
-
 
 def _retrieve(question: str, top_k: int) -> List[dict]:
     col = _ensure_chroma()
@@ -242,7 +409,6 @@ def _retrieve(question: str, top_k: int) -> List[dict]:
     for doc, meta, dist in zip(docs, metas, dists):
         out.append({"text": doc, "meta": meta or {}, "distance": dist})
     return out
-
 
 def _answer(question: str, contexts: List[dict]) -> str:
     client = _ensure_openai()
@@ -290,13 +456,11 @@ Runbook excerpts:
     out_text = (out_text or "").strip() or (getattr(resp, "output_text", "") or "").strip()
     return out_text or "No answer returned."
 
-
 # =====================
 # Lambda handler
 # =====================
 
 def lambda_handler(event, context):
-    # Handle CORS preflight
     if _get_method(event) == "OPTIONS":
         return _response(event, 200, {"ok": True})
 
@@ -317,6 +481,13 @@ def lambda_handler(event, context):
                 "chroma_collection": CHROMA_COLLECTION,
                 "embed_model": EMBED_MODEL,
             })
+
+        # -----------------
+        # AI News
+        # GET /news/latest
+        # -----------------
+        if path == "/news/latest" and method == "GET":
+            return _response(event, 200, _get_ai_news_payload())
 
         # -----------------
         # List runbooks
@@ -357,13 +528,11 @@ def lambda_handler(event, context):
 
             qs = _get_qs(event)
 
-            # Option 1: full key provided
             if "key" in qs and qs["key"]:
                 key = qs["key"]
                 content = _get_object_text(S3_BUCKET, key)
                 return _response(event, 200, {"key": key, "content": content})
 
-            # Option 2: filename provided
             if "name" in qs and qs["name"]:
                 filename = qs["name"]
                 prefix = _s3_key(RUNBOOKS_PREFIX)

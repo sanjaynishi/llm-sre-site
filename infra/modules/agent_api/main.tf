@@ -39,9 +39,9 @@ resource "aws_iam_role" "lambda_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "lambda.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -84,7 +84,7 @@ resource "aws_ecr_repository" "agent_api" {
     scan_on_push = true
   }
 
-  # ✅ Important: never delete the repo (avoids RepositoryNotEmptyException)
+  # Never delete the repo (avoids RepositoryNotEmptyException)
   force_delete = false
 
   lifecycle {
@@ -117,9 +117,7 @@ resource "aws_lambda_function" "agent_api" {
   role          = aws_iam_role.lambda_role.arn
 
   package_type = "Image"
-
-  # MUST be set for Image Lambdas
-  image_uri = local.lambda_image_uri_effective
+  image_uri    = local.lambda_image_uri_effective
 
   timeout     = 30
   memory_size = 512
@@ -190,9 +188,12 @@ resource "aws_apigatewayv2_stage" "default" {
 }
 
 resource "aws_apigatewayv2_integration" "lambda_proxy" {
-  api_id                 = aws_apigatewayv2_api.http_api.id
-  integration_type       = "AWS_PROXY"
-  integration_uri        = aws_lambda_function.agent_api.invoke_arn
+  api_id           = aws_apigatewayv2_api.http_api.id
+  integration_type = "AWS_PROXY"
+
+  # ✅ Correct format for HTTP API Lambda proxy integration
+  integration_uri = "arn:aws:apigateway:${var.region}:lambda:path/2015-03-31/functions/${aws_lambda_function.agent_api.arn}/invocations"
+
   payload_format_version = "2.0"
 }
 
@@ -203,10 +204,13 @@ resource "aws_apigatewayv2_route" "api_proxy" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
 }
 
-resource "aws_lambda_permission" "allow_apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
+# ✅ Allow API Gateway HTTP API to invoke the Lambda
+resource "aws_lambda_permission" "allow_apigw_invoke" {
+  statement_id  = "AllowExecutionFromHttpApi"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.agent_api.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+
+  # Allow any stage/method/path under this HTTP API
+  source_arn = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
 }

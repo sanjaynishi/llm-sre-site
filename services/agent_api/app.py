@@ -4,15 +4,19 @@ LLM SRE Agent API (Lambda)
 Endpoints (behind CloudFront /api/*):
   GET  /api/health
   GET  /api/agents
+  GET  /api/news/latest
   POST /api/agent/run
   POST /api/runbooks/ask
+  GET  /api/_routes          (debug)
+  GET  /api/_debug/news      (debug: shows RSS/HN fetch errors)
   OPTIONS *  (CORS)
 
 Notes:
 - /api/agents must only include location-based agents (weather/travel).
 - RAG is question-based; do NOT list it in /api/agents.
-- Chroma requires sqlite3 >= 3.35. Lambda base image sqlite is older, so we shim with pysqlite3-binary.
-- We also hard-disable Chroma telemetry to avoid runtime noise/errors.
+- Chroma requires sqlite3 >= 3.35. Lambda base sqlite is older, so we shim with pysqlite3-binary.
+- Chroma telemetry disabled.
+- AI News uses RSS + HN (Algolia). No registration/API keys.
 """
 
 from __future__ import annotations
@@ -20,23 +24,35 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
-# In Lambda container we install pysqlite3-binary; this ensures chroma sees modern sqlite.
+#try:
+#    import pysqlite3.dbapi2 as sqlite3  # type: ignore
+
+#    sys.modules["sqlite3"] = sqlite3
+#except Exception:
+ #   pass
+
+
+# ---- sqlite shim (must be BEFORE any chromadb import) ----
 try:
-    import pysqlite3.dbapi2 as sqlite3  # type: ignore
+    import pysqlite3.dbapi2 as sqlite3
     sys.modules["sqlite3"] = sqlite3
 except Exception:
     pass
 
-# ---- disable Chroma telemetry (prevents posthog/telemetry errors in Lambda logs) ----
-# These env vars are harmless if ignored by a given version.
+
+# ---- disable Chroma telemetry ----
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
@@ -46,6 +62,7 @@ try:
     import boto3
 except Exception:
     boto3 = None
+
 
 # ---------------- Config ----------------
 
@@ -63,7 +80,7 @@ AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").stri
 
 # RAG storage
 S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
-VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma/").strip()
+VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma/").strip().lstrip("/")
 CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "runbooks_dev").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
 
@@ -87,6 +104,11 @@ _chroma_collection = None
 
 # ---------------- Basic helpers ----------------
 
+def _log(msg: str) -> None:
+    # Keep it simple; shows up in CloudWatch Logs
+    print(msg)
+
+
 def _s3_client():
     global _s3
     if boto3 is None:
@@ -103,10 +125,13 @@ def _pick_cors_origin(event: dict) -> str:
 
 
 def _json_response(event: dict, status_code: int, body: dict, extra_headers: dict | None = None) -> dict:
+    # CRITICAL: Always return a valid Lambda Proxy response (HTTP API v2).
+    # Use default=str so datetime/objects never break json.dumps.
     cors_origin = _pick_cors_origin(event)
+
     headers = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": cors_origin,
+        "Access-Control-Allow-Origin": str(cors_origin),
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         "Access-Control-Allow-Headers": (
             "Content-Type,Authorization,X-Requested-With,X-Amz-Date,X-Api-Key,X-Amz-Security-Token"
@@ -114,8 +139,14 @@ def _json_response(event: dict, status_code: int, body: dict, extra_headers: dic
         "Vary": "Origin",
     }
     if extra_headers:
-        headers.update(extra_headers)
-    return {"statusCode": status_code, "headers": headers, "body": json.dumps(body)}
+        for k, v in extra_headers.items():
+            headers[str(k)] = str(v)
+
+    return {
+        "statusCode": int(status_code),
+        "headers": headers,
+        "body": json.dumps(body, default=str),
+    }
 
 
 def _get_method(event: dict) -> str:
@@ -135,7 +166,7 @@ def _get_body_json(event: dict) -> dict:
     if not body:
         return {}
     if event.get("isBase64Encoded"):
-        body = base64.b64decode(body).decode("utf-8")
+        body = base64.b64decode(body).decode("utf-8", errors="replace")
     try:
         return json.loads(body)
     except json.JSONDecodeError as e:
@@ -144,17 +175,22 @@ def _get_body_json(event: dict) -> dict:
 
 # ---------------- HTTP helpers (stdlib) ----------------
 
-def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
+def _http_get_text(url: str, timeout_sec: int = 8) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "llm-sre-agent/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
         detail = (detail[:600] + "...") if len(detail) > 600 else detail
         raise RuntimeError(f"HTTP {e.code} GET {url} :: {detail}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error GET {url} :: {e}") from e
+
+
+def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
+    raw = _http_get_text(url, timeout_sec=timeout_sec)
+    return json.loads(raw)
 
 
 def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
@@ -165,7 +201,7 @@ def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeou
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
         detail = (detail[:900] + "...") if len(detail) > 900 else detail
@@ -185,15 +221,222 @@ def _extract_json_object(text: str) -> str:
     return text[start : end + 1]
 
 
+# ---------------- AI News (RSS + HN) ----------------
+
+NEWS_ENABLED = os.environ.get("NEWS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
+NEWS_MAX_ITEMS = int(os.environ.get("NEWS_MAX_ITEMS", "18"))
+NEWS_DAYS_BACK = int(os.environ.get("NEWS_DAYS_BACK", "7"))
+NEWS_CACHE_TTL_SEC = int(os.environ.get("NEWS_CACHE_TTL_SEC", str(6 * 60 * 60)))
+
+RSS_SOURCES = [
+    ("OpenAI", "https://openai.com/news/rss.xml", "Official"),
+    ("DeepMind", "https://deepmind.google/blog/feed/basic", "Research"),
+    ("Hugging Face", "https://huggingface.co/blog/feed.xml", "Open Source"),
+    ("AWS ML Blog", "https://aws.amazon.com/blogs/machine-learning/feed/", "MLOps"),
+    ("Microsoft Foundry", "https://devblogs.microsoft.com/foundry/feed/", "Enterprise"),
+    ("Anthropic", "https://www.anthropic.com/news/rss.xml", "Official"),
+]
+HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
+
+AI_KEYWORDS = [
+    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
+    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
+    "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
+]
+DROP_PATTERNS = [
+    r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
+    r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b",
+]
+
+_news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]*>", "", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _is_relevant(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in AI_KEYWORDS)
+
+
+def _is_noisy(text: str) -> bool:
+    t = (text or "").lower()
+    return any(re.search(p, t) for p in DROP_PATTERNS)
+
+
+def _dedupe(items: List[dict]) -> List[dict]:
+    seen = set()
+    out: List[dict] = []
+    for it in items:
+        u = (it.get("url") or "").strip().lower()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(it)
+    return out
+
+
+def _sort(items: List[dict]) -> List[dict]:
+    return sorted(items, key=lambda it: (it.get("publishedAt") or ""), reverse=True)
+
+
+def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
+    items: List[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return items
+
+    for it in root.findall(".//item"):
+        title = _strip_html((it.findtext("title") or "").strip())
+        link = (it.findtext("link") or "").strip()
+        desc = _strip_html((it.findtext("description") or "").strip())
+
+        if not title or not link:
+            continue
+
+        blob = f"{title} {desc}"
+        if not _is_relevant(blob) or _is_noisy(blob):
+            continue
+
+        published_at = None
+        pub = (it.findtext("pubDate") or "").strip()
+        if pub:
+            # Best effort parse; never crash news endpoint
+            try:
+                dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    continue
+                published_at = dt.astimezone().isoformat()
+            except Exception:
+                published_at = None
+
+        items.append({
+            "id": link[-16:] if len(link) > 16 else link,
+            "title": title[:180],
+            "url": link,
+            "summary": desc[:260],
+            "source": source_name,
+            "tag": tag,
+            "publishedAt": published_at,
+        })
+
+    return items
+
+
+def _fetch_rss_items_with_errors() -> Tuple[List[dict], List[dict]]:
+    out: List[dict] = []
+    errors: List[dict] = []
+    for source_name, url, tag in RSS_SOURCES:
+        try:
+            xml_text = _http_get_text(url, timeout_sec=8)
+            out.extend(_parse_rss(xml_text, source_name, tag))
+        except Exception as e:
+            errors.append({"source": source_name, "url": url, "error": str(e)[:400]})
+    return out, errors
+
+
+def _fetch_hn_items_with_errors() -> Tuple[List[dict], List[dict]]:
+    out: List[dict] = []
+    errors: List[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+    query = " OR ".join(["AI", "LLM", "OpenAI", "Anthropic", "Claude", "Gemini", "DeepMind", "Mistral", "RAG", "agentic"])
+
+    try:
+        url = HN_ALGOLIA.format(q=urllib.parse.quote(query))
+        data = _http_get_json(url, timeout_sec=8)
+        hits = (data.get("hits") or [])[:25]
+        for h in hits:
+            title = (h.get("title") or "").strip()
+            link = (h.get("url") or "").strip()
+            created = h.get("created_at")
+
+            if not title or not link:
+                continue
+            if not _is_relevant(title) or _is_noisy(title):
+                continue
+
+            published_at = None
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if dt < cutoff:
+                        continue
+                    published_at = dt.astimezone().isoformat()
+                except Exception:
+                    pass
+
+            out.append({
+                "id": link[-16:] if len(link) > 16 else link,
+                "title": title[:180],
+                "url": link,
+                "summary": "",
+                "source": "Hacker News",
+                "tag": "Community Signal",
+                "publishedAt": published_at,
+            })
+    except Exception as e:
+        errors.append({"source": "Hacker News", "url": "hn.algolia.com", "error": str(e)[:400]})
+
+    return out, errors
+
+
+def _handle_get_news_latest(event: dict) -> dict:
+    if not NEWS_ENABLED:
+        return _json_response(event, 200, {"updatedAt": _now_iso(), "items": [], "disabled": True})
+
+    now = time.time()
+    if _news_cache["payload"] is not None and (now - _news_cache["ts"] < NEWS_CACHE_TTL_SEC):
+        return _json_response(event, 200, _news_cache["payload"])
+
+    rss_items, rss_errors = _fetch_rss_items_with_errors()
+    hn_items, hn_errors = _fetch_hn_items_with_errors()
+
+    items = _dedupe(_sort(rss_items + hn_items))[:NEWS_MAX_ITEMS]
+
+    payload = {
+        "updatedAt": _now_iso(),
+        "items": items,
+        # Include errors so you can see if outbound is blocked (VPC/NAT/DNS)
+        "errors": (rss_errors + hn_errors)[:20],
+    }
+    _news_cache["ts"] = now
+    _news_cache["payload"] = payload
+    return _json_response(event, 200, payload)
+
+
+def _handle_get_debug_news(event: dict) -> dict:
+    # Force fetch + return errors, no cache
+    rss_items, rss_errors = _fetch_rss_items_with_errors()
+    hn_items, hn_errors = _fetch_hn_items_with_errors()
+    return _json_response(event, 200, {
+        "ok": True,
+        "updatedAt": _now_iso(),
+        "rss_count": len(rss_items),
+        "hn_count": len(hn_items),
+        "errors": (rss_errors + hn_errors),
+        "sample_titles": [x.get("title") for x in (rss_items + hn_items)[:5]],
+    })
+
+
 # ---------------- S3 config (agents/allowlists) ----------------
 
 def _s3_get_json(bucket: str, key: str) -> dict:
     try:
         resp = _s3_client().get_object(Bucket=bucket, Key=key)
-        raw = resp["Body"].read().decode("utf-8")
+        raw = resp["Body"].read().decode("utf-8", errors="replace")
         return json.loads(raw)
     except Exception as e:
-        print(f"S3 read failed: s3://{bucket}/{key} :: {e}")
+        _log(f"S3 read failed: s3://{bucket}/{key} :: {e}")
         return {}
 
 
@@ -248,7 +491,7 @@ def geocode_location(location: str) -> dict:
 
     def _query(name: str) -> List[dict]:
         qs = urllib.parse.urlencode({"name": name, "count": 1, "language": "en", "format": "json"})
-        data = _http_get_json(f"{base}?{qs}")
+        data = _http_get_json(f"{base}?{qs}", timeout_sec=8)
         return data.get("results") or []
 
     results = _query(safe_location)
@@ -276,36 +519,32 @@ def fetch_weather(lat: float, lon: float) -> dict:
         "longitude": lon,
         "timezone": "auto",
         "forecast_days": 7,
-        "current": ",".join(
-            [
-                "temperature_2m",
-                "apparent_temperature",
-                "relative_humidity_2m",
-                "precipitation",
-                "rain",
-                "showers",
-                "snowfall",
-                "cloud_cover",
-                "wind_speed_10m",
-                "wind_direction_10m",
-                "weather_code",
-            ]
-        ),
-        "daily": ",".join(
-            [
-                "weather_code",
-                "temperature_2m_max",
-                "temperature_2m_min",
-                "precipitation_sum",
-                "rain_sum",
-                "snowfall_sum",
-                "precipitation_probability_max",
-                "wind_speed_10m_max",
-            ]
-        ),
+        "current": ",".join([
+            "temperature_2m",
+            "apparent_temperature",
+            "relative_humidity_2m",
+            "precipitation",
+            "rain",
+            "showers",
+            "snowfall",
+            "cloud_cover",
+            "wind_speed_10m",
+            "wind_direction_10m",
+            "weather_code",
+        ]),
+        "daily": ",".join([
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_sum",
+            "rain_sum",
+            "snowfall_sum",
+            "precipitation_probability_max",
+            "wind_speed_10m_max",
+        ]),
     }
     url = f"{base}?{urllib.parse.urlencode(params)}"
-    return _http_get_json(url)
+    return _http_get_json(url, timeout_sec=8)
 
 
 # ---------------- OpenAI (Travel via HTTP) ----------------
@@ -448,7 +687,6 @@ def _ensure_chroma():
     if not VECTORS_PREFIX:
         raise RuntimeError("VECTORS_PREFIX env var missing")
 
-    # Pull the persisted store from S3 into /tmp
     _s3_download_prefix(S3_BUCKET, VECTORS_PREFIX, CHROMA_LOCAL_DIR)
 
     try:
@@ -462,7 +700,6 @@ def _ensure_chroma():
         settings=Settings(anonymized_telemetry=False, allow_reset=False),
     )
 
-    # get_or_create is safer across versions than get_collection (which throws if missing)
     _chroma_collection = _chroma_client.get_or_create_collection(CHROMA_COLLECTION)
     _ = _chroma_collection.count()
     return _chroma_collection
@@ -495,10 +732,6 @@ def _retrieve_chunks(question: str, top_k: int) -> List[Dict[str, Any]]:
 
 
 def _response_text_from_openai_response(resp: Any) -> str:
-    """
-    Robust extraction across OpenAI SDK versions.
-    Prefer resp.output_text when available; otherwise walk resp.output message content.
-    """
     try:
         ot = getattr(resp, "output_text", None)
         if isinstance(ot, str) and ot.strip():
@@ -566,14 +799,35 @@ Excerpts:
 # ---------------- Handlers ----------------
 
 def _handle_get_health(event: dict) -> dict:
-    # show sqlite version to confirm shim
     try:
         import sqlite3 as _s  # uses our shim if present
         sqlite_ver = getattr(_s, "sqlite_version", "unknown")
     except Exception:
         sqlite_ver = "unknown"
 
-    return _json_response(event, 200, {"ok": True, "sqlite_version": sqlite_ver})
+    return _json_response(event, 200, {
+        "ok": True,
+        "sqlite_version": sqlite_ver,
+        "news_enabled": NEWS_ENABLED,
+    })
+
+
+def _handle_get_routes(event: dict, method: str, path: str) -> dict:
+    return _json_response(event, 200, {
+        "ok": True,
+        "rawPath": event.get("rawPath"),
+        "normalizedPath": path,
+        "method": method,
+        "routes": [
+            "GET /health",
+            "GET /agents",
+            "POST /agent/run",
+            "POST /runbooks/ask",
+            "GET /news/latest",
+            "GET /_routes",
+            "GET /_debug/news",
+        ],
+    })
 
 
 def _handle_get_agents(event: dict) -> dict:
@@ -622,7 +876,7 @@ def _handle_get_agents(event: dict) -> dict:
         return _json_response(event, 200, merged)
 
     except Exception as e:
-        print(f"/agents fallback due to error: {e}")
+        _log(f"/agents fallback due to error: {e}")
         return _json_response(event, 200, default_agents)
 
 
@@ -640,38 +894,22 @@ def _handle_post_agent_run(event: dict) -> dict:
 
     if agent_id == AGENT_ID_WEATHER:
         if location not in set(weather_locations):
-            return _json_response(
-                event,
-                400,
-                {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}},
-            )
+            return _json_response(event, 400, {"error": {"code": "LOCATION_NOT_ALLOWED", "message": "Choose a location from dropdown"}})
 
         geo = geocode_location(location)
         if geo.get("lat") is None or geo.get("lon") is None:
             return _json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return _json_response(
-            event,
-            200,
-            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
-        )
+        return _json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
         if city not in set(travel_cities):
-            return _json_response(
-                event,
-                400,
-                {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}},
-            )
+            return _json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
 
         travel = get_travel_info(city)
-        return _json_response(
-            event,
-            200,
-            {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}},
-        )
+        return _json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
 
     return _json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
@@ -689,51 +927,63 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
 
-    return _json_response(
-        event,
-        200,
-        {
-            "question": question,
-            "top_k": top_k,
-            "sources": [
-                {
-                    "file": (c.get("meta") or {}).get("file"),
-                    "s3_key": (c.get("meta") or {}).get("s3_key"),
-                    "chunk": (c.get("meta") or {}).get("chunk"),
-                }
-                for c in contexts
-            ],
-            "answer": answer,
-        },
-    )
+    return _json_response(event, 200, {
+        "question": question,
+        "top_k": top_k,
+        "sources": [
+            {
+                "file": (c.get("meta") or {}).get("file"),
+                "s3_key": (c.get("meta") or {}).get("s3_key"),
+                "chunk": (c.get("meta") or {}).get("chunk"),
+            }
+            for c in contexts
+        ],
+        "answer": answer,
+    })
+
 
 # ---------------- Lambda entry ----------------
 
 def lambda_handler(event: dict, context: Any) -> dict:
-    method = _get_method(event)
-    path = _get_path(event)
+    # top-level guard: never let exceptions bubble to API GW generic 500
+    try:
+        method = _get_method(event)
+        path = _get_path(event)
 
-    if method == "OPTIONS":
-        return _json_response(event, 200, {"ok": True})
+        _log(f"REQ method={method} path={path} rawPath={event.get('rawPath')}")
 
-    if method == "GET" and (path == "/health" or path.endswith("/health")):
-        return _handle_get_health(event)
+        if method == "OPTIONS":
+            return _json_response(event, 200, {"ok": True})
 
-    if method == "GET" and (path == "/agents" or path.endswith("/agents")):
-        return _handle_get_agents(event)
+        if method == "GET" and (path == "/_routes" or path.endswith("/_routes")):
+            return _handle_get_routes(event, method, path)
 
-    if method == "POST" and (path == "/agent/run" or path.endswith("/agent/run")):
-        try:
+        if method == "GET" and (path == "/health" or path.endswith("/health")):
+            return _handle_get_health(event)
+
+        if method == "GET" and (path == "/agents" or path.endswith("/agents")):
+            return _handle_get_agents(event)
+
+        if method == "GET" and (path == "/_debug/news" or path.endswith("/_debug/news")):
+            return _handle_get_debug_news(event)
+
+        if method == "GET" and (path == "/news/latest" or path.endswith("/news/latest")):
+            return _handle_get_news_latest(event)
+
+        if method == "POST" and (path == "/agent/run" or path.endswith("/agent/run")):
             return _handle_post_agent_run(event)
-        except ValueError as e:
-            return _json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
-        except Exception as e:
-            return _json_response(event, 500, {"error": {"code": "AGENT_FAILED", "message": str(e)}})
 
-    if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
-        try:
+        if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
-        except Exception as e:
-            return _json_response(event, 500, {"error": {"code": "RAG_FAILED", "message": str(e)}})
 
-    return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}})
+        return _json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}})
+
+    except ValueError as e:
+        return _json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
+    except Exception as e:
+        # This is the key: stop API GW from returning {"message":"Internal Server Error"}
+        return _json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
+
+
+# Backward-compatible alias if anything is still configured as "app.handler"
+handler = lambda_handler

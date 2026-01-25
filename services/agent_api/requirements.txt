@@ -1,16 +1,20 @@
-# --- Core ---
+# ---------------- Core AWS + OpenAI ----------------
 openai>=1.6.0
 boto3>=1.28.0
 botocore>=1.31.0
 
-# --- SQLite shim for Chroma (Lambda base sqlite3 is too old) ---
-pysqlite3-binary>=0.5.2
+# ---------------- SQLite shim (for Chroma on Lambda & CI) ----------------
+# pysqlite3mc-binary has reliable manylinux wheels for Python 3.11
+# Works in GitHub Actions AND Lambda container images
+pysqlite3mc-binary==0.5.4
 
-# --- RAG / Vector DB ---
+# ---------------- Vector DB / RAG ----------------
 chromadb==0.5.23
 
-# Keep numpy < 2 to avoid build headaches
+# ---------------- Numerical deps ----------------
+# Pin <2.0 to avoid binary incompatibilities
 numpy==1.26.4
 
-# Optional (only if you do PDF ingestion inside Lambda; for query-only not required)
+# ---------------- Optional (safe to keep) ----------------
+# Only needed if you ingest PDFs inside Lambda
 pypdf>=4.0.0
