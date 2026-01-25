@@ -99,7 +99,7 @@ export default function AiNews() {
       setLoading(true);
       setErr("");
       try {
-        const res = await apiGet("/news/latest"); // backend should serve /api/news/latest or proxy accordingly
+        const res = await apiGet("/api/news/latest"); // backend should serve /api/news/latest or proxy accordingly
         if (!alive) return;
         setData(res);
       } catch (e) {

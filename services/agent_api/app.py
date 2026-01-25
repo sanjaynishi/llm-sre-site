@@ -877,7 +877,7 @@ def _handle_get_routes(event: dict, method: str, path: str) -> dict:
                 "GET /agents",
                 "POST /agent/run",
                 "POST /runbooks/ask",
-                "GET /news/latest",
+                "GET /api/news/latest",
                 "GET /_routes",
                 "GET /_debug/news",
             ],
