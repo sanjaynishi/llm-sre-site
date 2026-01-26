@@ -2,11 +2,12 @@
 news_service.py
 
 AI News (RSS + HN Algolia) with:
-- keyword filtering
+- keyword filtering (expanded for GPU / models / infra / partnerships)
 - mild "no-hype" drop patterns
 - dedupe + sort
 - cache w/ TTL
 - safe error reporting (never crashes endpoint)
+- optional extra RSS sources via env: NEWS_EXTRA_RSS
 
 Exports:
 - handle_get_news_latest(event) -> dict (json_response)
@@ -37,39 +38,39 @@ NEWS_MAX_ITEMS = int(os.environ.get("NEWS_MAX_ITEMS", "18"))
 NEWS_DAYS_BACK = int(os.environ.get("NEWS_DAYS_BACK", "7"))
 NEWS_CACHE_TTL_SEC = int(os.environ.get("NEWS_CACHE_TTL_SEC", str(6 * 60 * 60)))
 
-RSS_SOURCES = [
+# Optional: add feeds without redeploy
+# Format:
+#   NEWS_EXTRA_RSS="Name|https://feed.url|Tag,Name2|https://feed2|Tag2"
+NEWS_EXTRA_RSS = os.environ.get("NEWS_EXTRA_RSS", "").strip()
+
+RSS_SOURCES: List[Tuple[str, str, str]] = [
     ("OpenAI", "https://openai.com/news/rss.xml", "Official"),
     ("DeepMind", "https://deepmind.google/blog/feed/basic", "Research"),
     ("Hugging Face", "https://huggingface.co/blog/feed.xml", "Open Source"),
     ("AWS ML Blog", "https://aws.amazon.com/blogs/machine-learning/feed/", "MLOps"),
     ("Microsoft Foundry", "https://devblogs.microsoft.com/foundry/feed/", "Enterprise"),
-    ("Anthropic", "https://www.anthropic.com/news/rss.xml", "Official"),
+
+    # GPU / Infra coverage
+    ("NVIDIA Developer Blog", "https://developer.nvidia.com/blog/feed/", "GPU/Infra"),
+    ("NVIDIA Newsroom", "https://nvidianews.nvidia.com/rss.xml", "GPU/Infra"),
 ]
 
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
 
+# Broader scope: GPU, models, infra, partnerships (e.g., “AWS contract with OpenAI”)
 AI_KEYWORDS = [
-    "ai",
-    "llm",
-    "openai",
-    "gpt",
-    "claude",
-    "anthropic",
-    "gemini",
-    "deepmind",
-    "mistral",
-    "hugging face",
-    "transformer",
-    "rag",
-    "agentic",
-    "multimodal",
-    "inference",
-    "alignment",
-    "safety",
-    "eval",
-    "evals",
-    "rlhf",
-    "prompt",
+    # Core AI
+    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
+    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
+    "inference", "training", "serving", "alignment", "safety", "eval", "evals", "rlhf",
+
+    # GPU / acceleration
+    "gpu", "nvidia", "cuda", "tensor", "h100", "h200", "b200", "blackwell",
+    "dgx", "gb200", "datacenter", "cluster",
+
+    # Cloud / platforms / partnerships
+    "aws", "bedrock", "azure", "gcp", "oracle", "coreweave",
+    "partnership", "contract", "deal", "capacity",
 ]
 
 # Calm guardrails: drop overly-hype phrasing
@@ -87,7 +88,7 @@ DROP_PATTERNS = [
 _DEFAULT_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 aimlsre-news/1.0"
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 aimlsre-news/1.1"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -135,6 +136,35 @@ def _http_get_text(url: str, timeout_sec: int = 10) -> str:
 
 def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
     return json.loads(_http_get_text(url, timeout_sec=timeout_sec))
+
+
+def _parse_extra_rss_sources(env_val: str) -> List[Tuple[str, str, str]]:
+    """
+    NEWS_EXTRA_RSS="Name|URL|Tag,Name2|URL2|Tag2"
+    Returns list of (name,url,tag). Ignores invalid entries.
+    """
+    out: List[Tuple[str, str, str]] = []
+    if not env_val:
+        return out
+    for chunk in env_val.split(","):
+        chunk = (chunk or "").strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split("|")]
+        if len(parts) < 2:
+            continue
+        name = parts[0] or "Extra"
+        url = parts[1]
+        tag = parts[2] if len(parts) >= 3 and parts[2] else "Extra"
+        if url.startswith("http://") or url.startswith("https://"):
+            out.append((name, url, tag))
+    return out
+
+
+def _rss_sources_all() -> List[Tuple[str, str, str]]:
+    # Default sources + optional extras via env var
+    extra = _parse_extra_rss_sources(NEWS_EXTRA_RSS)
+    return RSS_SOURCES + extra
 
 
 def _parse_rss_date(pub: str) -> str | None:
@@ -238,7 +268,7 @@ def _sort(items: List[dict]) -> List[dict]:
 def _fetch_rss_items_with_errors() -> Tuple[List[dict], List[dict]]:
     out: List[dict] = []
     errors: List[dict] = []
-    for source_name, url, tag in RSS_SOURCES:
+    for source_name, url, tag in _rss_sources_all():
         try:
             xml_text = _http_get_text(url, timeout_sec=10)
             out.extend(_parse_rss(xml_text, source_name, tag))
@@ -247,14 +277,25 @@ def _fetch_rss_items_with_errors() -> Tuple[List[dict], List[dict]]:
     return out, errors
 
 
+def _hn_query() -> str:
+    # Broader than before; catches GPU/models/cloud partnership posts
+    terms = [
+        "AI", "LLM", "OpenAI", "Anthropic", "Claude", "Gemini", "DeepMind", "Mistral",
+        "RAG", "agentic",
+        "NVIDIA", "GPU", "H100", "H200", "Blackwell", "CUDA",
+        "inference", "training", "datacenter", "cluster",
+        "CoreWeave", "Bedrock", "AWS", "Azure", "GCP",
+        "partnership", "contract", "deal",
+    ]
+    return " OR ".join(terms)
+
+
 def _fetch_hn_items_with_errors() -> Tuple[List[dict], List[dict]]:
     out: List[dict] = []
     errors: List[dict] = []
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
-    query = " OR ".join(
-        ["AI", "LLM", "OpenAI", "Anthropic", "Claude", "Gemini", "DeepMind", "Mistral", "RAG", "agentic"]
-    )
+    query = _hn_query()
 
     try:
         url = HN_ALGOLIA.format(q=urllib.parse.quote(query))
@@ -342,6 +383,8 @@ def get_debug_news_payload() -> dict:
         "updatedAt": _now_iso(),
         "rss_count": len(rss_items),
         "hn_count": len(hn_items),
+        "sources_total": len(_rss_sources_all()),
+        "extra_rss_enabled": bool(NEWS_EXTRA_RSS),
         "errors": (rss_errors + hn_errors),
         "sample_titles": [x.get("title") for x in (rss_items + hn_items)[:5]],
     }
