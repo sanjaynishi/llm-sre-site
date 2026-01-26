@@ -37,7 +37,6 @@ from typing import Any, Dict, List, Tuple
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
 # IMPORTANT: chromadb checks sqlite3 version at import time.
-# This shim must be in place before any chromadb import occurs.
 try:
     import pysqlite3.dbapi2 as sqlite3  # type: ignore
 
@@ -69,7 +68,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2").strip()
 
 AGENT_CONFIG_BUCKET = os.environ.get("AGENT_CONFIG_BUCKET", "").strip()
-AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").strip()
+AGENT_CONFIG_PREFIX = os.environ.get("AGENT_CONFIG_PREFIX", "agent-config").strip().strip("/")
 
 # RAG storage
 S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
@@ -144,7 +143,7 @@ def _get_method(event: dict) -> str:
 
 def _get_path(event: dict) -> str:
     path = event.get("rawPath") or event.get("path") or "/"
-    # CloudFront behavior routes /api/* -> API GW; normalize
+    # CloudFront routes /api/* -> API GW; normalize away "/api"
     if path.startswith("/api/"):
         path = path[4:]  # remove "/api"
     return path
@@ -296,13 +295,12 @@ def _parse_rss_date(pub: str) -> str | None:
     if not pub:
         return None
 
-    # Common RSS formats (best-effort, never raise)
     fmts = [
-        "%a, %d %b %Y %H:%M:%S %Z",      # RFC822 with TZ name
-        "%a, %d %b %Y %H:%M:%S %z",      # RFC822 with numeric tz
-        "%Y-%m-%dT%H:%M:%S%z",           # ISO-ish
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%S",             # naive ISO
+        "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
     ]
     for f in fmts:
@@ -314,7 +312,6 @@ def _parse_rss_date(pub: str) -> str | None:
         except Exception:
             continue
 
-    # Some feeds provide "Z"
     try:
         dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
         return dt.astimezone().isoformat()
@@ -356,7 +353,7 @@ def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
                         continue
                     published_at = dt.astimezone().isoformat()
                 except Exception:
-                    published_at = iso  # still keep it
+                    published_at = iso
 
         items.append(
             {
@@ -450,7 +447,6 @@ def _handle_get_news_latest(event: dict) -> dict:
     payload = {
         "updatedAt": _now_iso(),
         "items": items,
-        # keep errors for visibility; never crash the endpoint
         "errors": (rss_errors + hn_errors)[:20],
     }
     _news_cache["ts"] = now
@@ -864,6 +860,7 @@ def _handle_get_health(event: dict) -> dict:
 
 
 def _handle_get_routes(event: dict, method: str, path: str) -> dict:
+    # Show *normalized* routes (after "/api" is stripped)
     return _json_response(
         event,
         200,
@@ -875,12 +872,13 @@ def _handle_get_routes(event: dict, method: str, path: str) -> dict:
             "routes": [
                 "GET /health",
                 "GET /agents",
-                "POST /agent/run",
-                "POST /runbooks/ask",
-                "GET /api/news/latest",
+                "GET /news/latest",
                 "GET /_routes",
                 "GET /_debug/news",
+                "POST /agent/run",
+                "POST /runbooks/ask",
             ],
+            "note": "CloudFront calls these as /api/*; handler normalizes by stripping '/api/'.",
         },
     )
 
@@ -1027,6 +1025,7 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "GET" and (path == "/_debug/news" or path.endswith("/_debug/news")):
             return _handle_get_debug_news(event)
 
+        # ✅ FIX: after normalization, this path is "/news/latest" (NOT "/api/news/latest")
         if method == "GET" and (path == "/news/latest" or path.endswith("/news/latest")):
             return _handle_get_news_latest(event)
 
@@ -1036,7 +1035,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
 
-        # ✅ FIXED: correct f-string + braces
         return _json_response(
             event,
             404,

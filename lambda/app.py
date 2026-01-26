@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import boto3
 from botocore.exceptions import ClientError
@@ -38,9 +38,10 @@ from botocore.exceptions import ClientError
 # IMPORTANT: keep this before any potential chromadb/sqlite import.
 try:
     import pysqlite3.dbapi2 as sqlite3  # provided by pysqlite3-binary
+
     sys.modules["sqlite3"] = sqlite3
 except Exception:
-    # If this fails, Chroma may fail later with sqlite version error
+    # If this fails, Chroma may fail later with sqlite version error.
     pass
 
 s3 = boto3.client("s3")
@@ -102,13 +103,10 @@ _news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
 
 def _s3_key(path: str) -> str:
     """Build full S3 key using S3_PREFIX."""
+    path = (path or "").lstrip("/")
     if not S3_PREFIX:
-        return path.lstrip("/")
-    return f"{S3_PREFIX.rstrip('/')}/{path.lstrip('/')}"
-
-def _pick_origin(event: dict) -> str:
-    headers = event.get("headers") or {}
-    return headers.get("origin") or headers.get("Origin") or "*"
+        return path
+    return f"{S3_PREFIX.rstrip('/')}/{path}"
 
 def _response(event: dict, status: int, body: dict) -> dict:
     # Always valid JSON response (avoid API GW generic 500)
@@ -116,7 +114,7 @@ def _response(event: dict, status: int, body: dict) -> dict:
         "statusCode": int(status),
         "headers": {
             "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",  # or _pick_origin(event) if you want strict allowlist
+            "Access-Control-Allow-Origin": "*",  # tighten later with allowlist if desired
             "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type,Authorization",
             "Vary": "Origin",
@@ -197,6 +195,13 @@ def _presign(bucket: str, key: str, expires: int = 300) -> str:
         Params={"Bucket": bucket, "Key": key},
         ExpiresIn=int(expires),
     )
+
+def _safe_name(name: str) -> str:
+    # prevent path traversal and weird keys when using ?name=
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return ""
+    return name
 
 # =====================
 # AI News helpers
@@ -410,7 +415,6 @@ def _ensure_chroma():
         path=CHROMA_LOCAL_DIR,
         settings=Settings(anonymized_telemetry=False),
     )
-    # get_collection will throw if missing; create if you prefer
     _chroma_collection = client.get_or_create_collection(CHROMA_COLLECTION)
     _ = _chroma_collection.count()
     return _chroma_collection
@@ -501,18 +505,21 @@ Runbook excerpts:
 # =====================
 
 def lambda_handler(event: dict, context: Any) -> dict:
-    # Never let exceptions bubble to API GW generic 500
     try:
         method = _get_method(event)
         path = _get_path(event)
+
+        # Log minimal routing info (shows in CloudWatch)
+        print(f"REQ method={method} path={path} rawPath={event.get('rawPath')}")
 
         if method == "OPTIONS":
             return _response(event, 200, {"ok": True})
 
         # -----------------
         # Health check
+        # GET /api/health -> normalized "/health"
         # -----------------
-        if path == "/health" and method == "GET":
+        if method == "GET" and (path == "/health" or path.endswith("/health")):
             try:
                 import sqlite3 as _s
                 sqlite_ver = getattr(_s, "sqlite_version", "unknown")
@@ -533,16 +540,16 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
         # -----------------
         # AI News
-        # GET /news/latest
+        # GET /api/news/latest -> normalized "/news/latest"
         # -----------------
-        if path == "/news/latest" and method == "GET":
+        if method == "GET" and (path == "/news/latest" or path.endswith("/news/latest")):
             return _response(event, 200, _get_ai_news_payload())
 
         # -----------------
         # List runbooks
-        # GET /runbooks
+        # GET /api/runbooks -> normalized "/runbooks"
         # -----------------
-        if path == "/runbooks" and method == "GET":
+        if method == "GET" and (path == "/runbooks" or path.endswith("/runbooks")):
             if not S3_BUCKET:
                 return _response(event, 500, {"error": "S3_BUCKET not set"})
 
@@ -561,23 +568,20 @@ def lambda_handler(event: dict, context: Any) -> dict:
                     })
 
             runbooks.sort(key=lambda x: (x.get("name") or "").lower())
-            return _response(event, 200, {
-                "bucket": S3_BUCKET,
-                "prefix": prefix,
-                "runbooks": runbooks,
-            })
+            return _response(event, 200, {"bucket": S3_BUCKET, "prefix": prefix, "runbooks": runbooks})
 
         # -----------------
         # Get runbook doc (presigned URL)
-        # GET /doc?name=FILE.pdf  OR /doc?key=full/s3/key.pdf
+        # GET /api/doc?name=FILE.pdf  OR /api/doc?key=full/s3/key.pdf
+        # normalized path "/doc"
         # -----------------
-        if path == "/doc" and method == "GET":
+        if method == "GET" and (path == "/doc" or path.endswith("/doc")):
             if not S3_BUCKET:
                 return _response(event, 500, {"error": "S3_BUCKET not set"})
 
             qs = _get_qs(event)
             key = (qs.get("key") or "").strip()
-            name = (qs.get("name") or "").strip()
+            name = _safe_name(qs.get("name") or "")
 
             if key:
                 url = _presign(S3_BUCKET, key, expires=300)
@@ -597,9 +601,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
         # -----------------
         # Agents
-        # GET /agents
+        # GET /api/agents -> normalized "/agents"
         # -----------------
-        if path == "/agents" and method == "GET":
+        if method == "GET" and (path == "/agents" or path.endswith("/agents")):
             if not S3_BUCKET:
                 return _response(event, 500, {"error": "S3_BUCKET not set"})
             key = _s3_key(AGENTS_KEY)
@@ -608,9 +612,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
         # -----------------
         # RAG ask
-        # POST /runbooks/ask
+        # POST /api/runbooks/ask -> normalized "/runbooks/ask"
         # -----------------
-        if path == "/runbooks/ask" and method == "POST":
+        if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             req = _get_body_json(event)
             question = (req.get("question") or "").strip()
             top_k = int(req.get("top_k") or 5)
@@ -638,9 +642,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
                 "answer": ans,
             })
 
-        # -----------------
-        # Not found
-        # -----------------
         return _response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {method} {path}"}})
 
     except ValueError as e:

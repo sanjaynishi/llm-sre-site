@@ -77,6 +77,11 @@ variable "runbooks_prefix" {
   description = "Prefix under agent_config_bucket where runbook PDFs live"
 }
 
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
 # ------------------------------------
 # RAG config
 # ------------------------------------
