@@ -14,7 +14,10 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 COPY sitecustomize.py /var/lang/lib/python3.11/sitecustomize.py
 
 # 4) Copy app
-COPY app.py .
+#COPY app.py .
+
+# instead of copying only app.py for refatoring, copy the entire context
+COPY . .
 
 # 5) Build-time sanity check: verify shim + chromadb import
 RUN python - <<'PY'

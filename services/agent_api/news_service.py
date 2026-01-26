@@ -1,54 +1,108 @@
+"""
+news_service.py
+
+AI News (RSS + HN Algolia) with:
+- keyword filtering
+- mild "no-hype" drop patterns
+- dedupe + sort
+- cache w/ TTL
+- safe error reporting (never crashes endpoint)
+
+Exports:
+- handle_get_news_latest(event) -> dict (json_response)
+- handle_get_debug_news(event) -> dict (json_response)
+"""
+
+from __future__ import annotations
+
+import json
+import os
 import re
 import time
-import hashlib
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
 
-import httpx
-import feedparser
+from core.response import json_response
 
-# -----------------------------
-# Free sources (no registration)
-# -----------------------------
+# =====================
+# Config (env)
+# =====================
+
+NEWS_ENABLED = os.environ.get("NEWS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
+NEWS_MAX_ITEMS = int(os.environ.get("NEWS_MAX_ITEMS", "18"))
+NEWS_DAYS_BACK = int(os.environ.get("NEWS_DAYS_BACK", "7"))
+NEWS_CACHE_TTL_SEC = int(os.environ.get("NEWS_CACHE_TTL_SEC", str(6 * 60 * 60)))
+
 RSS_SOURCES = [
     ("OpenAI", "https://openai.com/news/rss.xml", "Official"),
     ("DeepMind", "https://deepmind.google/blog/feed/basic", "Research"),
     ("Hugging Face", "https://huggingface.co/blog/feed.xml", "Open Source"),
     ("AWS ML Blog", "https://aws.amazon.com/blogs/machine-learning/feed/", "MLOps"),
     ("Microsoft Foundry", "https://devblogs.microsoft.com/foundry/feed/", "Enterprise"),
-    # Anthropic RSS can be inconsistent; keep optional and non-fatal:
     ("Anthropic", "https://www.anthropic.com/news/rss.xml", "Official"),
 ]
 
-HN_URL = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
+HN_ALGOLIA = "https://hn.algolia.com/api/v1/search_by_date?query={q}&tags=story&hitsPerPage=25"
 
 AI_KEYWORDS = [
-    "ai", "llm", "openai", "gpt", "claude", "anthropic", "gemini", "deepmind",
-    "mistral", "hugging face", "transformer", "rag", "agentic", "multimodal",
-    "inference", "alignment", "safety", "eval", "evals", "rlhf", "prompt",
-    "foundation model", "model release"
+    "ai",
+    "llm",
+    "openai",
+    "gpt",
+    "claude",
+    "anthropic",
+    "gemini",
+    "deepmind",
+    "mistral",
+    "hugging face",
+    "transformer",
+    "rag",
+    "agentic",
+    "multimodal",
+    "inference",
+    "alignment",
+    "safety",
+    "eval",
+    "evals",
+    "rlhf",
+    "prompt",
 ]
 
-# Calm / etheric guardrails: drop hype language
+# Calm guardrails: drop overly-hype phrasing
 DROP_PATTERNS = [
-    r"\bdoom\b", r"\bpanic\b", r"\bdestroy\b", r"\bapocalypse\b", r"\bterrifying\b",
-    r"\breplaces all jobs\b", r"\bend of\b", r"\bsingularity\b"
+    r"\bdoom\b",
+    r"\bpanic\b",
+    r"\bdestroy\b",
+    r"\bapocalypse\b",
+    r"\bterrifying\b",
+    r"\breplaces all jobs\b",
+    r"\bend of\b",
+    r"\bsingularity\b",
 ]
 
-MAX_ITEMS = 18
-DAYS_BACK = 7
+_DEFAULT_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 aimlsre-news/1.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "close",
+}
 
-# In-memory cache (simple + low-cost)
-_CACHE: Dict[str, Any] = {"ts": 0.0, "payload": None}
-CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 hours
+_news_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
 
+
+# =====================
+# Utilities
+# =====================
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
-
-
-def _hash_id(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
 def _strip_html(s: str) -> str:
@@ -59,121 +113,113 @@ def _strip_html(s: str) -> str:
 
 def _is_relevant(text: str) -> bool:
     t = (text or "").lower()
-    return any(k in t for k in AI_KEYWORDS)
+    if not any(k in t for k in AI_KEYWORDS):
+        return False
+    if any(re.search(p, t) for p in DROP_PATTERNS):
+        return False
+    return True
 
 
-def _is_noisy(text: str) -> bool:
-    t = (text or "").lower()
-    return any(re.search(p, t) for p in DROP_PATTERNS)
+def _http_get_text(url: str, timeout_sec: int = 10) -> str:
+    req = urllib.request.Request(url, headers=_DEFAULT_HTTP_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        detail = (detail[:600] + "...") if len(detail) > 600 else detail
+        raise RuntimeError(f"HTTP {e.code} GET {url} :: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error GET {url} :: {e}") from e
 
 
-def _parse_feed_dt(entry: Any) -> Optional[datetime]:
-    for key in ("published_parsed", "updated_parsed"):
-        val = getattr(entry, key, None)
-        if val:
-            try:
-                return datetime.fromtimestamp(time.mktime(val), tz=timezone.utc)
-            except Exception:
-                continue
-    return None
+def _http_get_json(url: str, timeout_sec: int = 10) -> dict:
+    return json.loads(_http_get_text(url, timeout_sec=timeout_sec))
 
 
-async def _fetch_rss(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
+def _parse_rss_date(pub: str) -> str | None:
+    pub = (pub or "").strip()
+    if not pub:
+        return None
 
-    for source_name, url, tag in RSS_SOURCES:
+    fmts = [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for f in fmts:
         try:
-            resp = await client.get(url, timeout=15)
-            resp.raise_for_status()
-            feed = feedparser.parse(resp.text)
-
-            for e in (feed.entries or [])[:25]:
-                title = _strip_html(getattr(e, "title", "") or "")
-                link = (getattr(e, "link", "") or "").strip()
-                summary = _strip_html(getattr(e, "summary", "") or "")
-
-                if not title or not link:
-                    continue
-
-                blob = f"{title} {summary}"
-                if not _is_relevant(blob) or _is_noisy(blob):
-                    continue
-
-                dt = _parse_feed_dt(e)
-                if dt and dt < cutoff:
-                    continue
-
-                items.append({
-                    "id": _hash_id(link),
-                    "title": title[:180],
-                    "url": link,
-                    "summary": summary[:260],
-                    "source": source_name,
-                    "tag": tag,
-                    "publishedAt": dt.astimezone().isoformat() if dt else None,
-                })
+            dt = datetime.strptime(pub, f)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone().isoformat()
         except Exception:
-            # Calm failure: ignore per-source errors
             continue
 
-    return items
+    try:
+        dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+        return dt.astimezone().isoformat()
+    except Exception:
+        return None
 
 
-async def _fetch_hn(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
-
-    query = " OR ".join([
-        "AI", "LLM", "OpenAI", "Anthropic", "Claude", "Gemini", "DeepMind",
-        "Mistral", "Hugging Face", "RAG", "agentic", "alignment", "inference"
-    ])
+def _parse_rss(xml_text: str, source_name: str, tag: str) -> List[dict]:
+    items: List[dict] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
 
     try:
-        url = HN_URL.format(q=httpx.QueryParams({"q": query})["q"])
-        resp = await client.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        hits = (data.get("hits") or [])[:25]
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return items
 
-        for h in hits:
-            title = (h.get("title") or "").strip()
-            link = (h.get("url") or "").strip()
-            created = h.get("created_at")
+    for it in root.findall(".//item"):
+        title = _strip_html((it.findtext("title") or "").strip())
+        link = (it.findtext("link") or "").strip()
+        desc = _strip_html((it.findtext("description") or "").strip())
 
-            if not title or not link:
-                continue
-            if not _is_relevant(title) or _is_noisy(title):
-                continue
+        if not title or not link:
+            continue
 
-            published_at = None
-            if created:
+        blob = f"{title} {desc}"
+        if not _is_relevant(blob):
+            continue
+
+        published_at = None
+        pub = (it.findtext("pubDate") or "").strip()
+        if pub:
+            iso = _parse_rss_date(pub)
+            if iso:
                 try:
-                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
                     if dt < cutoff:
                         continue
                     published_at = dt.astimezone().isoformat()
                 except Exception:
-                    pass
+                    published_at = iso
 
-            items.append({
-                "id": _hash_id(link),
+        items.append(
+            {
+                "id": link[-16:] if len(link) > 16 else link,
                 "title": title[:180],
                 "url": link,
-                "summary": "",
-                "source": "Hacker News",
-                "tag": "Community Signal",
+                "summary": desc[:260],
+                "source": source_name,
+                "tag": tag,
                 "publishedAt": published_at,
-            })
-    except Exception:
-        pass
+            }
+        )
 
     return items
 
 
-def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _dedupe(items: List[dict]) -> List[dict]:
     seen = set()
-    out: List[Dict[str, Any]] = []
+    out: List[dict] = []
     for it in items:
         u = (it.get("url") or "").strip().lower()
         if not u or u in seen:
@@ -183,24 +229,131 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _sort(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    def key(it: Dict[str, Any]) -> str:
+def _sort(items: List[dict]) -> List[dict]:
+    def _k(it: dict) -> str:
         return it.get("publishedAt") or ""
-    return sorted(items, key=key, reverse=True)
+    return sorted(items, key=_k, reverse=True)
 
 
-async def get_latest_news() -> Dict[str, Any]:
+def _fetch_rss_items_with_errors() -> Tuple[List[dict], List[dict]]:
+    out: List[dict] = []
+    errors: List[dict] = []
+    for source_name, url, tag in RSS_SOURCES:
+        try:
+            xml_text = _http_get_text(url, timeout_sec=10)
+            out.extend(_parse_rss(xml_text, source_name, tag))
+        except Exception as e:
+            errors.append({"source": source_name, "url": url, "error": str(e)[:400]})
+    return out, errors
+
+
+def _fetch_hn_items_with_errors() -> Tuple[List[dict], List[dict]]:
+    out: List[dict] = []
+    errors: List[dict] = []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=NEWS_DAYS_BACK)
+    query = " OR ".join(
+        ["AI", "LLM", "OpenAI", "Anthropic", "Claude", "Gemini", "DeepMind", "Mistral", "RAG", "agentic"]
+    )
+
+    try:
+        url = HN_ALGOLIA.format(q=urllib.parse.quote(query))
+        data = _http_get_json(url, timeout_sec=10)
+        hits = (data.get("hits") or [])[:25]
+
+        for h in hits:
+            title = (h.get("title") or "").strip()
+            link = (h.get("url") or "").strip()
+            created = h.get("created_at")
+
+            if not title or not link:
+                continue
+            if not _is_relevant(title):
+                continue
+
+            published_at = None
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if dt < cutoff:
+                        continue
+                    published_at = dt.astimezone().isoformat()
+                except Exception:
+                    pass
+
+            out.append(
+                {
+                    "id": link[-16:] if len(link) > 16 else link,
+                    "title": title[:180],
+                    "url": link,
+                    "summary": "",
+                    "source": "Hacker News",
+                    "tag": "Community Signal",
+                    "publishedAt": published_at,
+                }
+            )
+
+    except Exception as e:
+        errors.append({"source": "Hacker News", "url": "hn.algolia.com", "error": str(e)[:400]})
+
+    return out, errors
+
+
+def get_news_latest_payload(force_refresh: bool = False) -> dict:
+    """
+    Returns payload dict:
+      { updatedAt, items, errors }
+    Uses in-memory cache per Lambda container.
+    """
+    if not NEWS_ENABLED:
+        return {"updatedAt": _now_iso(), "items": [], "disabled": True}
+
     now = time.time()
-    if _CACHE["payload"] is not None and (now - _CACHE["ts"] < CACHE_TTL_SECONDS):
-        return _CACHE["payload"]
+    if (
+        not force_refresh
+        and _news_cache["payload"] is not None
+        and (now - float(_news_cache["ts"])) < NEWS_CACHE_TTL_SEC
+    ):
+        return _news_cache["payload"]
 
-    async with httpx.AsyncClient(headers={"User-Agent": "llm-sre-site-ai-news/1.0"}) as client:
-        rss_items = await _fetch_rss(client)
-        hn_items = await _fetch_hn(client)
+    rss_items, rss_errors = _fetch_rss_items_with_errors()
+    hn_items, hn_errors = _fetch_hn_items_with_errors()
 
-    combined = _dedupe(_sort(rss_items + hn_items))[:MAX_ITEMS]
-    payload = {"updatedAt": _now_iso(), "items": combined}
+    items = _dedupe(_sort(rss_items + hn_items))[:NEWS_MAX_ITEMS]
+    payload = {
+        "updatedAt": _now_iso(),
+        "items": items,
+        "errors": (rss_errors + hn_errors)[:20],
+    }
 
-    _CACHE["ts"] = now
-    _CACHE["payload"] = payload
+    _news_cache["ts"] = now
+    _news_cache["payload"] = payload
     return payload
+
+
+def get_debug_news_payload() -> dict:
+    rss_items, rss_errors = _fetch_rss_items_with_errors()
+    hn_items, hn_errors = _fetch_hn_items_with_errors()
+
+    return {
+        "ok": True,
+        "updatedAt": _now_iso(),
+        "rss_count": len(rss_items),
+        "hn_count": len(hn_items),
+        "errors": (rss_errors + hn_errors),
+        "sample_titles": [x.get("title") for x in (rss_items + hn_items)[:5]],
+    }
+
+
+# =====================
+# Handlers (return API GW proxy response)
+# =====================
+
+def handle_get_news_latest(event: dict) -> dict:
+    return json_response(event, 200, get_news_latest_payload())
+
+
+def handle_get_debug_news(event: dict) -> dict:
+    return json_response(event, 200, get_debug_news_payload())
