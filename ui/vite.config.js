@@ -6,11 +6,10 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": {
-        target: "https://dev.snrcs.com",
+        target: "https://dev.aimlsre.com",
         changeOrigin: true,
         secure: true,
       },
     },
   },
 });
-
