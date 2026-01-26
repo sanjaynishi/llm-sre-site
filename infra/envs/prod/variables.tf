@@ -120,5 +120,7 @@ variable "ui_bucket_name" {
 }
 
 variable "analytics_bucket_domain_name" {
-  type = string
+  description = "Optional logging bucket domain name (e.g., my-bucket.s3.amazonaws.com). Leave empty to disable logging."
+  type        = string
+  default     = ""
 }
