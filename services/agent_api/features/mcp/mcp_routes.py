@@ -19,8 +19,11 @@ _ALLOWED_BASE_URLS = {
 
 def handle_post_mcp_run(event: Dict[str, Any]) -> Dict[str, Any]:
     req = get_body_json(event)
+
+    # Scenario can be passed by UI; default is first-call-html
     scenario = (req.get("scenario") or "first-call-html").strip()
 
+    # base_url must be allowlisted
     base_url = (req.get("base_url") or "https://dev.aimlsre.com").strip().rstrip("/")
 
     if base_url not in _ALLOWED_BASE_URLS:
@@ -36,5 +39,12 @@ def handle_post_mcp_run(event: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
 
-    trace = run_mcp_scenario(scenario=scenario, base_url=base_url)
+    # Pass through extra fields (audience, intent, etc.) safely
+    extra = dict(req)
+    # ensure these keys exist and are consistent
+    extra["scenario"] = scenario
+    extra["base_url"] = base_url
+
+    # IMPORTANT: works with keyword args; orchestrator signature supports this
+    trace = run_mcp_scenario(**extra)
     return json_response(event, 200, trace)
