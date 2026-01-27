@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import urllib.request
 import urllib.error
 
+from openai import OpenAI
+
+
+# -----------------------
+# Data model for UI trace
+# -----------------------
 
 @dataclass
 class McpStep:
     step: int
     name: str
-    type: str                 # "plan" | "tool" | "observe" | "retry" | "reason" | "recommend"
-    status: str               # "ok" | "warn" | "error"
+    type: str            # "plan" | "tool" | "retry" | "reason" | "recommend" | "note"
+    status: str          # "ok" | "warn" | "error"
     started_at: str
     finished_at: str
     detail: Dict[str, Any]
@@ -27,11 +35,42 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_json_loads(s: str) -> Optional[dict]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """
+    Best-effort extraction if model wraps JSON with extra text.
+    """
+    if not text:
+        return None
+    # 1) direct parse
+    j = _safe_json_loads(text)
+    if isinstance(j, dict):
+        return j
+
+    # 2) try to find first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        j2 = _safe_json_loads(text[start : end + 1])
+        if isinstance(j2, dict):
+            return j2
+    return None
+
+
+# -----------------------
+# Safe HTTP tool executor
+# -----------------------
+
 def _http_request(method: str, url: str, body: Optional[dict] = None, timeout_sec: int = 12) -> Dict[str, Any]:
     data = None
     headers = {"Accept": "application/json"}
     if body is not None:
-        import json
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
@@ -42,7 +81,7 @@ def _http_request(method: str, url: str, body: Optional[dict] = None, timeout_se
             ct = resp.headers.get("Content-Type", "")
             return {
                 "ok": True,
-                "status": resp.status,
+                "status": int(getattr(resp, "status", 200) or 200),
                 "content_type": ct,
                 "body": raw.decode("utf-8", errors="replace"),
             }
@@ -51,25 +90,151 @@ def _http_request(method: str, url: str, body: Optional[dict] = None, timeout_se
         return {
             "ok": False,
             "status": int(getattr(e, "code", 0) or 0),
-            "content_type": e.headers.get("Content-Type", ""),
+            "content_type": (e.headers.get("Content-Type", "") if e.headers else ""),
             "body": raw,
         }
     except Exception as e:
+        return {"ok": False, "status": 0, "content_type": "", "body": str(e)}
+
+
+def _looks_like_html(resp: Dict[str, Any]) -> bool:
+    ct = (resp.get("content_type") or "").lower()
+    body = (resp.get("body") or "")
+    if "text/html" in ct:
+        return True
+    if body.lstrip().lower().startswith("<!doctype html") or body.lstrip().lower().startswith("<html"):
+        return True
+    return False
+
+
+# -----------------------
+# LLM helpers (ONE model)
+# -----------------------
+
+def _openai_client() -> OpenAI:
+    # Uses OPENAI_API_KEY by default. If you use Azure/OpenAI-compatible gateway,
+    # you can set OPENAI_BASE_URL and OPENAI_API_KEY accordingly.
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip() or None
+    if base_url:
+        return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(api_key=api_key)
+
+
+def _mcp_model() -> str:
+    # One standard model for BOTH scenarios
+    # Set this in Lambda env: MCP_MODEL="gpt-4.1-mini" (example) or whatever you prefer
+    return os.environ.get("MCP_MODEL", "").strip() or "gpt-4.1-mini"
+
+
+def _llm_json(client: OpenAI, model: str, system: str, user: str, timeout_sec: int = 25) -> Tuple[Optional[dict], str]:
+    """
+    Calls model and returns (json_dict_or_none, raw_text).
+    """
+    # Responses API keeps you future-proof on OpenAI SDK v2.x
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+        max_output_tokens=1200,
+        timeout=timeout_sec,
+    )
+
+    # SDK returns a structured response; easiest is output_text helper
+    raw = getattr(resp, "output_text", None)
+    if raw is None:
+        # fallback: try to build text from output blocks
+        raw = ""
+        try:
+            for item in resp.output:
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") in ("output_text", "text"):
+                        raw += getattr(c, "text", "") or ""
+        except Exception:
+            raw = ""
+
+    raw = (raw or "").strip()
+    j = _extract_json_object(raw)
+    return j, raw
+
+
+# -----------------------
+# Scenario specs
+# -----------------------
+
+def _scenario_spec(scenario: str) -> Dict[str, Any]:
+    """
+    Keep scenario spec simple. LLM generates the plan + explanations.
+    Tools are still constrained by whitelist.
+    """
+    if scenario == "quantum-sre-10":
         return {
-            "ok": False,
-            "status": 0,
-            "content_type": "",
-            "body": str(e),
+            "scenario": "quantum-sre-10",
+            "goal": "Explain quantum computing in practical SRE terms and produce a realistic, safe 10-step learning + experimentation plan.",
+            "must_steps": 10,
+            "allowed_tools": [
+                {"method": "GET", "path": "/api/health"},
+                # (optional later) {"method":"GET","path":"/api/news/latest"}
+            ],
+            "notes": [
+                "No hype. Clarify what quantum is NOT.",
+                "Use practical analogies (queuing, probabilistic failure, optimization).",
+                "Avoid claiming speedups unless you qualify assumptions.",
+            ],
         }
 
+    # default
+    return {
+        "scenario": "first-call-html",
+        "goal": "Diagnose why first API call sometimes returns HTML/504 instead of JSON and prove retry behavior, then recommend mitigations.",
+        "must_steps": 7,
+        "allowed_tools": [
+            {"method": "GET", "path": "/api/health"},
+            {"method": "POST", "path": "/api/runbooks/ask"},
+        ],
+        "notes": [
+            "Detect HTML error pages (CloudFront) vs JSON.",
+            "Show a retry with small backoff.",
+        ],
+    }
+
+
+def _validate_tool_call(tool: Dict[str, Any], allowed: List[Dict[str, str]]) -> Tuple[bool, str]:
+    method = (tool.get("method") or tool.get("tool") or "").upper().strip()
+    path = (tool.get("path") or "").strip()
+    if not method or not path:
+        return False, "Missing method/path"
+
+    if not path.startswith("/api/"):
+        return False, "Path must start with /api/"
+
+    ok = any(a["method"] == method and a["path"] == path for a in allowed)
+    if not ok:
+        return False, f"Tool not allowed: {method} {path}"
+
+    # body limits
+    body = tool.get("body")
+    if body is not None:
+        try:
+            bs = json.dumps(body)
+            if len(bs) > 6000:
+                return False, "Tool body too large"
+        except Exception:
+            return False, "Invalid tool body"
+    return True, ""
+
+
+# -----------------------
+# Main orchestrator
+# -----------------------
 
 def run_mcp_scenario(scenario: str, base_url: str) -> Dict[str, Any]:
-    """
-    MCP MVP: one-shot run, returns a full trace.
-    This is intentionally synchronous to keep it simple in Lambda.
-    """
     run_id = f"mcp-{uuid.uuid4().hex[:10]}"
     started_at = _now_iso()
+
     steps: List[McpStep] = []
     step_no = 0
 
@@ -88,136 +253,197 @@ def run_mcp_scenario(scenario: str, base_url: str) -> Dict[str, Any]:
             )
         )
 
-    # -------------------------
-    # Step 1: Planner (LLM-like)
-    # -------------------------
-    t0 = time.time()
-    plan = {
-        "goal": "Diagnose first-call HTML/504 issue and prove retry behavior",
-        "steps": [
-            {"tool": "GET", "path": "/api/health"},
-            {"tool": "POST", "path": "/api/runbooks/ask", "body": {"question": "hello", "top_k": 5}},
-            {"tool": "POST", "path": "/api/runbooks/ask", "body": {"question": "hello", "top_k": 5}, "retry": True},
-        ],
-        "why_agentic": "We create a plan, execute tools, observe anomalies, retry with strategy, then recommend fixes.",
-    }
-    add_step("Create execution plan", "plan", "ok", {"plan": plan}, t0)
+    scenario = (scenario or "").strip() or "first-call-html"
+    base_url = (base_url or "").strip().rstrip("/")
+    if not base_url:
+        base_url = "https://dev.aimlsre.com"  # safe fallback
 
-    # Scenario routing (only one scenario for now)
-    if scenario not in ("first-call-html", "first-call-504", "first-call-timeout"):
-        scenario = "first-call-html"
+    spec = _scenario_spec(scenario)
 
-    # -------------------------
-    # Step 2: Tool - GET /health
-    # -------------------------
+    client = _openai_client()
+    model = _mcp_model()
+
+    # ---------------
+    # Step 1: PLAN (LLM)
+    # ---------------
     t0 = time.time()
-    health = _http_request("GET", f"{base_url}/api/health", timeout_sec=10)
-    add_step(
-        "Probe health endpoint",
-        "tool",
-        "ok" if health["ok"] else "warn",
-        {
-            "request": {"method": "GET", "url": f"{base_url}/api/health"},
-            "response": {"status": health["status"], "content_type": health["content_type"]},
-        },
-        t0,
+    system = (
+        "You are an SRE orchestration planner. "
+        "Return STRICT JSON only. No markdown. No extra text."
     )
-
-    # -------------------------
-    # Step 3: Tool - POST /runbooks/ask (first attempt)
-    # -------------------------
-    t0 = time.time()
-    first = _http_request(
-        "POST",
-        f"{base_url}/api/runbooks/ask",
-        body={"question": "hello", "top_k": 5},
-        timeout_sec=15,
-    )
-    first_is_html = "text/html" in (first.get("content_type") or "").lower()
-    first_failed = (not first["ok"]) or first_is_html
-
-    add_step(
-        "Runbooks ask (first attempt)",
-        "tool",
-        "warn" if first_failed else "ok",
+    user = json.dumps(
         {
-            "request": {"method": "POST", "url": f"{base_url}/api/runbooks/ask"},
-            "response": {
-                "status": first["status"],
-                "content_type": first["content_type"],
-                "body_head": (first.get("body") or "")[:240],
+            "task": "Create an MCP execution plan as JSON.",
+            "spec": spec,
+            "output_contract": {
+                "goal": "string",
+                "why_agentic": "string",
+                "steps": [
+                    {
+                        "name": "string",
+                        "type": "plan|tool|retry|reason|recommend|note",
+                        "tool": {"method": "GET|POST", "path": "/api/...", "body": {"any": "json"}}  # only when type=tool
+                    }
+                ],
+                "constraints": {
+                    "max_steps": 12,
+                    "allowed_tools": spec["allowed_tools"],
+                },
             },
-            "interpretation": (
-                "Non-JSON (text/html) indicates CloudFront error page or upstream timeout"
-                if first_is_html
-                else "OK"
-            ),
+            "rules": [
+                "If you include any tool steps, they MUST be from allowed_tools exactly.",
+                "For first-call-html: include a tool call to GET /api/health and POST /api/runbooks/ask, then a retry step and a second POST retry.",
+                "For quantum-sre-10: produce exactly 10 steps, mostly explanation steps; only optional tool is GET /api/health.",
+                "Keep steps short and readable for UI.",
+            ],
         },
-        t0,
+        ensure_ascii=False,
     )
 
-    # -------------------------
-    # Step 4: Retry strategy
-    # -------------------------
+    plan_json, plan_raw = _llm_json(client, model, system=system, user=user)
+    if not plan_json:
+        # hard fallback if model fails: keep site working
+        fallback = {
+            "goal": spec["goal"],
+            "why_agentic": "Fallback plan used because planner LLM returned invalid JSON; still executing safely.",
+            "steps": [{"name": "Note: Planner fallback", "type": "note"}],
+        }
+        add_step("Create execution plan", "plan", "warn", {"plan": fallback, "llm_raw_head": plan_raw[:400]}, t0)
+        plan = fallback
+    else:
+        add_step("Create execution plan", "plan", "ok", {"plan": plan_json}, t0)
+        plan = plan_json
+
+    # normalize steps
+    plan_steps = plan.get("steps") if isinstance(plan, dict) else None
+    if not isinstance(plan_steps, list):
+        plan_steps = []
+
+    # ---------------
+    # Execute steps (only tool steps actually call network)
+    # ---------------
+    allowed_tools = spec.get("allowed_tools", [])
+    max_steps = 12
+    executed_tools = 0
+
+    for s in plan_steps[:max_steps]:
+        name = (s.get("name") or "").strip() or "Step"
+        type_ = (s.get("type") or "note").strip()
+
+        # tool
+        if type_ == "tool":
+            t0 = time.time()
+            ok, why = _validate_tool_call(s.get("tool") or {}, allowed_tools)
+            if not ok:
+                add_step(
+                    name,
+                    "tool",
+                    "error",
+                    {"error": "Tool validation failed", "why": why, "tool": s.get("tool")},
+                    t0,
+                )
+                continue
+
+            tool = s["tool"]
+            method = tool.get("method", tool.get("tool", "GET")).upper()
+            path = tool["path"]
+            body = tool.get("body")
+            url = f"{base_url}{path}"
+
+            resp = _http_request(method, url, body=body, timeout_sec=20)
+            executed_tools += 1
+
+            add_step(
+                name,
+                "tool",
+                "ok" if resp["ok"] and not _looks_like_html(resp) else "warn",
+                {
+                    "request": {"method": method, "url": url, "body": body},
+                    "response": {
+                        "status": resp.get("status"),
+                        "content_type": resp.get("content_type"),
+                        "body_head": (resp.get("body") or "")[:260],
+                    },
+                    "interpretation": (
+                        "Looks like HTML error page (CloudFront/timeout)"
+                        if _looks_like_html(resp)
+                        else "OK"
+                    ),
+                },
+                t0,
+            )
+            continue
+
+        # retry step (no-op, just trace + tiny backoff)
+        if type_ == "retry":
+            t0 = time.time()
+            time.sleep(0.25)
+            add_step(name, "retry", "ok", {"backoff_ms": 250}, t0)
+            continue
+
+        # any other step = trace only
+        t0 = time.time()
+        add_step(name, type_, "ok", {"note": "Non-tool step (explanation/analysis)."}, t0)
+
+    # ---------------
+    # Final summary (LLM) – same model
+    # ---------------
     t0 = time.time()
-    retry_note = {
-        "why_retry": "First call can fail due to cold start / heavy init; retry should succeed if backend is healthy.",
-        "backoff_ms": 250,
+    trace = {
+        "scenario": scenario,
+        "base_url": base_url,
+        "spec": spec,
+        "steps_executed": [asdict(x) for x in steps],
     }
-    time.sleep(0.25)
-    add_step("Apply retry strategy", "retry", "ok", retry_note, t0)
 
-    # -------------------------
-    # Step 5: Tool - POST /runbooks/ask (retry)
-    # -------------------------
-    t0 = time.time()
-    second = _http_request(
-        "POST",
-        f"{base_url}/api/runbooks/ask",
-        body={"question": "hello", "top_k": 5},
-        timeout_sec=20,
-    )
-    second_is_html = "text/html" in (second.get("content_type") or "").lower()
-    second_ok = second["ok"] and (not second_is_html)
-
-    add_step(
-        "Runbooks ask (retry)",
-        "tool",
-        "ok" if second_ok else "error",
+    system2 = "You are an SRE analyst. Return STRICT JSON only. No markdown."
+    user2 = json.dumps(
         {
-            "response": {
-                "status": second["status"],
-                "content_type": second["content_type"],
-                "body_head": (second.get("body") or "")[:240],
-            }
+            "task": "Summarize the run into root-cause + recommended mitigations, grounded ONLY in the observed trace.",
+            "trace": trace,
+            "output_contract": {
+                "likely_root_cause": "string",
+                "confidence": "low|medium|high",
+                "recommended_actions": ["string"],
+            },
+            "rules": [
+                "Do NOT invent tool outputs. Use only what is in trace.",
+                "If first-call-html: mention cold start / timeout / CloudFront HTML error pages and client retry mitigation.",
+                "If quantum-sre-10: provide a safe 10-step learning plan and clarify limitations.",
+            ],
         },
-        t0,
+        ensure_ascii=False,
     )
 
-    # -------------------------
-    # Step 6: Reason + Recommend
-    # -------------------------
-    t0 = time.time()
-    root_cause = {
-        "likely_root_cause": "Cold start / initialization latency causing CloudFront to return HTML error page on first call.",
-        "signals": [
-            "First attempt sometimes returns text/html CloudFront error page (504) then retry returns JSON 200.",
-            "Health endpoint is consistently JSON.",
-        ],
-        "confidence": "high" if second_ok and first_failed else "medium",
-    }
-    add_step("Root-cause reasoning", "reason", "ok", root_cause, t0)
-
-    t0 = time.time()
-    recommendations = {
-        "recommended_actions": [
-            "Add client-side retry when response content-type is not JSON (1 quick retry with small backoff).",
-            "Lazy-load heavy components (Chroma download/init) only when /runbooks/ask is called (you already do, but ensure no eager init).",
-            "Optional: scheduled warm-up ping to /api/health (or /api/runbooks/ask with trivial question) every 5–10 min in dev.",
-            "If needed: increase API Gateway/Lambda timeout or reduce first-call init size.",
-        ]
-    }
-    add_step("Recommended fixes", "recommend", "ok", recommendations, t0)
+    summary_json, summary_raw = _llm_json(client, model, system=system2, user=user2, timeout_sec=25)
+    if not summary_json:
+        add_step(
+            "LLM summary",
+            "reason",
+            "warn",
+            {"error": "LLM returned invalid JSON", "llm_raw_head": summary_raw[:500]},
+            t0,
+        )
+    else:
+        # add as two steps so UI looks nice
+        add_step(
+            "Root-cause reasoning",
+            "reason",
+            "ok",
+            {
+                "likely_root_cause": summary_json.get("likely_root_cause"),
+                "confidence": summary_json.get("confidence"),
+            },
+            t0,
+        )
+        t0 = time.time()
+        add_step(
+            "Recommended fixes",
+            "recommend",
+            "ok",
+            {"recommended_actions": summary_json.get("recommended_actions") or []},
+            t0,
+        )
 
     finished_at = _now_iso()
     return {
@@ -225,6 +451,7 @@ def run_mcp_scenario(scenario: str, base_url: str) -> Dict[str, Any]:
         "run_id": run_id,
         "scenario": scenario,
         "base_url": base_url,
+        "model": model,
         "started_at": started_at,
         "finished_at": finished_at,
         "steps": [asdict(s) for s in steps],

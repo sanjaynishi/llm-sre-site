@@ -13,13 +13,13 @@ export const MCP_SCENARIOS = [
         base_url: baseUrl,
       }),
       expectedSteps: [
-        "Create execution plan",
+        "Create execution plan (LLM)",
         "Probe /api/health",
         "POST /api/runbooks/ask (initial)",
-        "Detect HTML or timeout",
-        "Retry with adjusted strategy",
-        "Explain CloudFront + Lambda cold-start behavior",
-        "Recommend mitigations",
+        "Detect HTML/non-JSON or timeout",
+        "Retry strategy (small backoff)",
+        "POST /api/runbooks/ask (retry)",
+        "Root-cause + mitigations (LLM summary)",
       ],
     },
   
@@ -30,22 +30,18 @@ export const MCP_SCENARIOS = [
         "Explain quantum computing in practical SRE terms and orchestrate a safe, realistic learning path.",
       question:
         "Explain quantum computing for an SRE audience, validate claims vs reality, compare classical vs quantum, and produce a safe 10-step learning and experimentation plan.",
-      request: () => ({
+      request: (baseUrl) => ({
         scenario: "quantum-sre-10",
+        base_url: baseUrl, // ✅ important
         audience: "sre",
         intent: "education",
       }),
       expectedSteps: [
-        "Define goal and constraints",
-        "Clarify what quantum is NOT",
-        "Explain qubits and superposition",
-        "Explain entanglement practically",
-        "Compare classical vs quantum workloads",
-        "Identify real enterprise use-cases",
-        "Identify anti-patterns",
-        "Choose safe simulators",
-        "Design learning roadmap",
-        "Summarize risks and next steps",
+        "Create execution plan (LLM)",
+        "10-step learning + experimentation plan",
+        "Clear what quantum is NOT",
+        "Practical SRE analogies",
+        "Risks and next actions (LLM summary)",
       ],
     },
   ];
