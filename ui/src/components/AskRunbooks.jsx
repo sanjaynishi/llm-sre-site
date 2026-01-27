@@ -1,5 +1,45 @@
 import React, { useMemo, useState } from "react";
 
+async function postJsonWithSoftRetry(url, body, retryDelayMs = 800) {
+  // First attempt
+  let res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  let text = await res.text();
+  let json = null;
+
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // not JSON → likely CloudFront HTML / 504 on cold start
+  }
+
+  if (res.ok && json) {
+    return { res, json };
+  }
+
+  // Retry once if HTML / non-JSON
+  await new Promise((r) => setTimeout(r, retryDelayMs));
+
+  res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  text = await res.text();
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+
+  return { res, json, rawText: text };
+}
+
 export default function AskRunbooks() {
   const [question, setQuestion] = useState("");
   const [topK, setTopK] = useState(5);
@@ -10,7 +50,10 @@ export default function AskRunbooks() {
   const [raw, setRaw] = useState(null);
   const [showRaw, setShowRaw] = useState(false);
 
-  const canAsk = useMemo(() => question.trim().length > 0 && !loading, [question, loading]);
+  const canAsk = useMemo(
+    () => question.trim().length > 0 && !loading,
+    [question, loading]
+  );
 
   async function onAsk() {
     const q = question.trim();
@@ -26,35 +69,31 @@ export default function AskRunbooks() {
     setRaw(null);
 
     try {
-      const res = await fetch("/api/runbooks/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, top_k: Number(topK) || 5 }),
-      });
+      const { res, json, rawText } = await postJsonWithSoftRetry(
+        "/api/runbooks/ask",
+        { question: q, top_k: Number(topK) || 5 }
+      );
 
-      const data = await res.json().catch(() => null);
-
-      if (!res.ok) {
-        const msg =
-          data?.error?.message ||
-          data?.message ||
-          `Request failed (${res.status})`;
-        setStatus(msg);
-        setRaw(data);
+      if (!res.ok || !json) {
+        setStatus(
+          json?.error?.message ||
+            json?.message ||
+            `Request failed (${res.status}). Backend may still be warming up.`
+        );
+        setRaw(json || { raw: rawText?.slice(0, 800) });
         return;
       }
 
-      // API supports either success or {error:{...}}
-      if (data?.error) {
-        setStatus(data.error.message || "RAG failed.");
-        setRaw(data);
+      if (json.error) {
+        setStatus(json.error.message || "RAG failed.");
+        setRaw(json);
         return;
       }
 
       setStatus("Done.");
-      setAnswer(data?.answer || "");
-      setSources(Array.isArray(data?.sources) ? data.sources : []);
-      setRaw(data);
+      setAnswer(json.answer || "");
+      setSources(Array.isArray(json.sources) ? json.sources : []);
+      setRaw(json);
     } catch (e) {
       setStatus(String(e?.message || e));
     } finally {
@@ -91,7 +130,14 @@ export default function AskRunbooks() {
         }}
       />
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 12 }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          alignItems: "center",
+          marginTop: 12,
+        }}
+      >
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
           Top K:
           <input
@@ -136,17 +182,19 @@ export default function AskRunbooks() {
           <h3 style={{ marginTop: 0 }}>Answer</h3>
           <div>{answer}</div>
 
-          {sources?.length > 0 && (
+          {sources.length > 0 && (
             <>
               <h3 style={{ marginTop: 18 }}>Sources</h3>
               <ul style={{ marginTop: 8 }}>
                 {sources.map((s, i) => (
                   <li key={i} style={{ marginBottom: 6 }}>
                     <code>{s.file || "runbook"}</code>
-                    {typeof s.chunk !== "undefined" && s.chunk !== null ? (
+                    {s.chunk !== undefined && (
                       <span style={{ opacity: 0.8 }}> (chunk {s.chunk})</span>
-                    ) : null}
-                    {s.s3_key ? <span style={{ opacity: 0.7 }}> — {s.s3_key}</span> : null}
+                    )}
+                    {s.s3_key && (
+                      <span style={{ opacity: 0.7 }}> — {s.s3_key}</span>
+                    )}
                   </li>
                 ))}
               </ul>
