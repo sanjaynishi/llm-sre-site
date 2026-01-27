@@ -9,6 +9,7 @@ Endpoints (behind CloudFront /api/*):
   GET  /api/news/latest
   POST /api/agent/run
   POST /api/runbooks/ask
+  POST /api/mcp/run
   GET  /api/_routes          (debug)
   GET  /api/_debug/news      (debug)
   OPTIONS *                  (CORS)
@@ -24,23 +25,22 @@ import json
 import os
 import shutil
 import sys
-from datetime import timezone
 from typing import Any, Dict, List, Tuple
 
 from core.request import get_method, get_path, get_body_json
 from core.response import json_response
 
 from news_service import handle_get_debug_news, handle_get_news_latest
-
-from features.mcp.mcp_routes import handle_post_mcp_run
+from features.mcp.mcp_routes import handle_post_mcp_run  # ✅ MCP handler lives here
 
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
 # IMPORTANT: chromadb checks sqlite3 version at import time.
 try:
     import pysqlite3.dbapi2 as sqlite3  # type: ignore
+
     sys.modules["sqlite3"] = sqlite3
 except Exception:
-    # If shim isn't available, chromadb import will fail later (and we surface a clear error).
+    # If shim isn't available, chromadb import may fail later (surface a clear error).
     pass
 
 # ---- disable Chroma telemetry ----
@@ -172,6 +172,7 @@ def _effective_allowlists() -> Tuple[List[str], List[str]]:
 
 import urllib.parse
 import urllib.request
+import urllib.error
 
 
 def _http_get_json(url: str, timeout_sec: int = 8) -> dict:
@@ -246,9 +247,6 @@ def fetch_weather(lat: float, lon: float) -> dict:
 
 
 # ---------------- OpenAI (Travel via HTTP) ----------------
-
-import urllib.error
-
 
 def _http_post_json(url: str, payload: dict, headers: dict | None = None, timeout_sec: int = 25) -> dict:
     data = json.dumps(payload).encode("utf-8")
@@ -633,12 +631,18 @@ def _handle_post_agent_run(event: dict) -> dict:
             return json_response(event, 500, {"error": {"code": "GEOCODE_FAILED", "message": "No coordinates returned"}})
 
         weather = fetch_weather(float(geo["lat"]), float(geo["lon"]))
-        return json_response(event, 200, {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}})
+        return json_response(
+            event,
+            200,
+            {"result": {"title": f"Weather: {location}", "geocoding": geo, "weather": weather}},
+        )
 
     if agent_id == AGENT_ID_TRAVEL:
         city = location.strip()
         if city not in set(travel_cities):
-            return json_response(event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}})
+            return json_response(
+                event, 400, {"error": {"code": "CITY_NOT_ALLOWED", "message": "Choose a city from dropdown"}}
+            )
 
         travel = get_travel_info(city)
         return json_response(event, 200, {"result": {"title": f"Travel plan: {city}", "city": city, "travel_plan": travel}})
@@ -711,7 +715,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
-        
+
+        # ✅ MCP route (delegates to features/mcp/mcp_routes.py)
         if method == "POST" and (path == "/mcp/run" or path.endswith("/mcp/run")):
             return handle_post_mcp_run(event)
 
