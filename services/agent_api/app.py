@@ -32,6 +32,8 @@ from core.response import json_response
 
 from news_service import handle_get_debug_news, handle_get_news_latest
 
+from features.mcp.mcp_routes import handle_post_mcp_run
+
 # ---- sqlite shim (must be BEFORE any chromadb import) ----
 # IMPORTANT: chromadb checks sqlite3 version at import time.
 try:
@@ -551,6 +553,7 @@ def _handle_get_routes(event: dict, method: str, path: str) -> dict:
                 "GET /_debug/news",
                 "POST /agent/run",
                 "POST /runbooks/ask",
+                "POST /mcp/run",
             ],
             "note": "CloudFront calls these as /api/*; handler normalizes by stripping '/api/'.",
         },
@@ -708,6 +711,9 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
+        
+        if method == "POST" and (path == "/mcp/run" or path.endswith("/mcp/run")):
+            return handle_post_mcp_run(event)
 
         return json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}})
 
