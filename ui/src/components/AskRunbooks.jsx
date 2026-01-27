@@ -1,43 +1,81 @@
+// ui/src/components/AskRunbooks.jsx
 import React, { useMemo, useState } from "react";
 
-async function postJsonWithSoftRetry(url, body, retryDelayMs = 800) {
-  // First attempt
-  let res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
-  });
+/**
+ * POST JSON with a single "soft retry" when the first response is likely
+ * a CloudFront/Origin HTML error page (504/502/etc) or otherwise non-JSON.
+ */
+async function postJsonWithSoftRetry(
+  url,
+  body,
+  {
+    retryDelayMs = 800,
+    retryOnStatuses = [502, 503, 504],
+    retryOnNonJson = true,
+  } = {}
+) {
+  async function attempt() {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(body ?? {}),
+    });
 
-  let text = await res.text();
-  let json = null;
+    const text = await res.text();
 
-  try {
-    json = JSON.parse(text);
-  } catch {
-    // not JSON → likely CloudFront HTML / 504 on cold start
+    // Best-effort JSON parse
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    const looksLikeHtml =
+      contentType.includes("text/html") ||
+      /^\s*<!doctype html/i.test(text) ||
+      /^\s*<html[\s>]/i.test(text);
+
+    const isNonJson = !json && (retryOnNonJson || looksLikeHtml);
+    const shouldRetry =
+      (!res.ok && retryOnStatuses.includes(res.status)) || isNonJson;
+
+    return {
+      res,
+      json,
+      rawText: text,
+      meta: {
+        contentType,
+        looksLikeHtml,
+        isNonJson,
+        shouldRetry,
+      },
+    };
   }
 
-  if (res.ok && json) {
-    return { res, json };
+  // Attempt #1
+  let out = await attempt();
+  if (out.res.ok && out.json) return out;
+
+  // Soft retry once (only if it looks like a transient HTML/non-JSON issue or 5xx warmup)
+  if (out.meta.shouldRetry) {
+    await new Promise((r) => setTimeout(r, retryDelayMs));
+    const out2 = await attempt();
+
+    // If retry succeeded, return it; otherwise return the second attempt (more recent)
+    if (out2.res.ok && out2.json) return out2;
+    return {
+      ...out2,
+      meta: { ...out2.meta, retried: true, firstAttempt: out.meta },
+    };
   }
 
-  // Retry once if HTML / non-JSON
-  await new Promise((r) => setTimeout(r, retryDelayMs));
-
-  res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  text = await res.text();
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-
-  return { res, json, rawText: text };
+  // No retry performed
+  return { ...out, meta: { ...out.meta, retried: false } };
 }
 
 export default function AskRunbooks() {
@@ -67,35 +105,64 @@ export default function AskRunbooks() {
     setAnswer("");
     setSources([]);
     setRaw(null);
+    setShowRaw(false);
 
     try {
-      const { res, json, rawText } = await postJsonWithSoftRetry(
+      const payload = { question: q, top_k: Number(topK) || 5 };
+
+      // Call with soft retry
+      const { res, json, rawText, meta } = await postJsonWithSoftRetry(
         "/api/runbooks/ask",
-        { question: q, top_k: Number(topK) || 5 }
+        payload,
+        { retryDelayMs: 900 }
       );
 
+      // Helpful status note if we retried
+      if (meta?.retried) {
+        setStatus("Backend warmed up — retry succeeded (or attempted).");
+      }
+
+      // If still not OK or not JSON, show a friendly error
       if (!res.ok || !json) {
-        setStatus(
+        const msg =
           json?.error?.message ||
-            json?.message ||
-            `Request failed (${res.status}). Backend may still be warming up.`
+          json?.message ||
+          (meta?.looksLikeHtml
+            ? `Expected JSON but got "text/html". This usually means CloudFront/Origin returned HTML (cold start/timeout). (HTTP ${res.status})`
+            : `Request failed (HTTP ${res.status}).`);
+
+        setStatus(msg);
+
+        // Store raw info for debugging
+        setRaw(
+          json || {
+            error: {
+              code: "NON_JSON_RESPONSE",
+              message: msg,
+              httpStatus: res.status,
+              contentType: meta?.contentType || null,
+              retried: meta?.retried || false,
+              rawPreview: (rawText || "").slice(0, 800),
+            },
+          }
         );
-        setRaw(json || { raw: rawText?.slice(0, 800) });
         return;
       }
 
-      if (json.error) {
+      // API supports either success or {error:{...}}
+      if (json?.error) {
         setStatus(json.error.message || "RAG failed.");
         setRaw(json);
         return;
       }
 
-      setStatus("Done.");
-      setAnswer(json.answer || "");
-      setSources(Array.isArray(json.sources) ? json.sources : []);
+      setStatus(meta?.retried ? "Done (after retry)." : "Done.");
+      setAnswer(json?.answer || "");
+      setSources(Array.isArray(json?.sources) ? json.sources : []);
       setRaw(json);
     } catch (e) {
       setStatus(String(e?.message || e));
+      setRaw({ error: { code: "CLIENT_EXCEPTION", message: String(e?.message || e) } });
     } finally {
       setLoading(false);
     }
@@ -168,7 +235,7 @@ export default function AskRunbooks() {
         <span style={{ marginLeft: 6, opacity: 0.85 }}>{status}</span>
       </div>
 
-      {answer && (
+      {(answer || raw) && (
         <div
           style={{
             marginTop: 18,
@@ -179,22 +246,28 @@ export default function AskRunbooks() {
             whiteSpace: "pre-wrap",
           }}
         >
-          <h3 style={{ marginTop: 0 }}>Answer</h3>
-          <div>{answer}</div>
+          {answer ? (
+            <>
+              <h3 style={{ marginTop: 0 }}>Answer</h3>
+              <div>{answer}</div>
+            </>
+          ) : (
+            <h3 style={{ marginTop: 0 }}>Response</h3>
+          )}
 
-          {sources.length > 0 && (
+          {sources?.length > 0 && (
             <>
               <h3 style={{ marginTop: 18 }}>Sources</h3>
               <ul style={{ marginTop: 8 }}>
                 {sources.map((s, i) => (
                   <li key={i} style={{ marginBottom: 6 }}>
                     <code>{s.file || "runbook"}</code>
-                    {s.chunk !== undefined && (
+                    {typeof s.chunk !== "undefined" && s.chunk !== null ? (
                       <span style={{ opacity: 0.8 }}> (chunk {s.chunk})</span>
-                    )}
-                    {s.s3_key && (
+                    ) : null}
+                    {s.s3_key ? (
                       <span style={{ opacity: 0.7 }}> — {s.s3_key}</span>
-                    )}
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -211,6 +284,7 @@ export default function AskRunbooks() {
                 background: "#fff",
                 cursor: "pointer",
               }}
+              type="button"
             >
               {showRaw ? "Hide raw JSON" : "Show raw JSON"}
             </button>
