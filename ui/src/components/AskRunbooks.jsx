@@ -2,12 +2,10 @@
 import React, { useMemo, useState } from "react";
 
 /**
- * POST JSON with a single "soft retry" when the first response is likely
+ * POST JSON with a single "soft retry" when first response is likely
  * a CloudFront/Origin HTML error page (504/502/etc) or otherwise non-JSON.
  *
- * ✅ UX fix:
- * - If first attempt looks like HTML / non-JSON warmup, do NOT show scary error.
- * - Show "Warming up… retrying once" and only error if retry also fails.
+ * onRetry(attemptInfo) lets the UI show "Retrying..." immediately.
  */
 async function postJsonWithSoftRetry(
   url,
@@ -16,7 +14,7 @@ async function postJsonWithSoftRetry(
     retryDelayMs = 900,
     retryOnStatuses = [502, 503, 504],
     retryOnNonJson = true,
-    onWarmup, // optional callback for UI status updates
+    onRetry = null,
   } = {}
 ) {
   async function attempt() {
@@ -46,6 +44,7 @@ async function postJsonWithSoftRetry(
       /^\s*<html[\s>]/i.test(text);
 
     const isNonJson = !json && (retryOnNonJson || looksLikeHtml);
+
     const shouldRetry =
       (!res.ok && retryOnStatuses.includes(res.status)) || isNonJson;
 
@@ -66,23 +65,32 @@ async function postJsonWithSoftRetry(
   const first = await attempt();
   if (first.res.ok && first.json) return { ...first, meta: { ...first.meta, retried: false } };
 
-  // Soft retry once if it looks like warmup / HTML / non-JSON / 5xx
+  // Retry once if it looks transient (HTML/non-JSON or 5xx warmup)
   if (first.meta.shouldRetry) {
-    if (typeof onWarmup === "function") {
-      onWarmup(first); // let UI update status before waiting
-    }
+    onRetry?.({
+      attempt: 1,
+      maxAttempts: 2,
+      status: first.res.status,
+      contentType: first.meta.contentType,
+      looksLikeHtml: first.meta.looksLikeHtml,
+    });
 
     await new Promise((r) => setTimeout(r, retryDelayMs));
 
     const second = await attempt();
     if (second.res.ok && second.json) {
-      return { ...second, meta: { ...second.meta, retried: true, firstAttempt: first.meta } };
+      return {
+        ...second,
+        meta: { ...second.meta, retried: true, firstAttempt: first.meta },
+      };
     }
 
-    return { ...second, meta: { ...second.meta, retried: true, firstAttempt: first.meta } };
+    return {
+      ...second,
+      meta: { ...second.meta, retried: true, firstAttempt: first.meta },
+    };
   }
 
-  // No retry performed
   return { ...first, meta: { ...first.meta, retried: false } };
 }
 
@@ -123,68 +131,59 @@ export default function AskRunbooks() {
         payload,
         {
           retryDelayMs: 900,
-          onWarmup: (firstAttempt) => {
-            // ✅ key UX change: don't show scary HTML error on first attempt
-            const code = firstAttempt?.res?.status;
-            setStatus(`Warming up backend… Retrying${code ? ` (HTTP ${code})` : ""}`);
+          onRetry: () => {
+            // ✅ This is the missing UI message
+            setStatus("Retrying (1/1)… warming backend (cold start).");
           },
         }
       );
 
-      // If still not OK or not JSON after retry, show a friendly error
       if (!res.ok || !json) {
-        const contentType = meta?.contentType || "";
-        const looksHtml = meta?.looksLikeHtml || contentType.includes("text/html");
+        const contentType = (res.headers.get("content-type") || "").toLowerCase();
 
         const msg =
-          (json?.error?.message || json?.message) ??
-          (looksHtml
-            ? `Backend still warming up: expected JSON but got HTML. Please try again. (HTTP ${res.status})`
+          json?.error?.message ||
+          json?.message ||
+          (contentType.includes("text/html") || meta?.looksLikeHtml
+            ? `Expected JSON but got "text/html". This usually means CloudFront/Origin returned HTML (cold start/timeout). (HTTP ${res.status})`
             : `Request failed (HTTP ${res.status}).`);
 
         setStatus(msg);
-
-        // Store raw info for debugging
         setRaw(
           json || {
             error: {
               code: "NON_JSON_RESPONSE",
               message: msg,
               httpStatus: res.status,
-              contentType: meta?.contentType || null,
+              contentType: meta?.contentType || contentType || null,
               retried: !!meta?.retried,
               rawPreview: (rawText || "").slice(0, 800),
-              firstAttempt: meta?.firstAttempt || null,
             },
           }
         );
         return;
       }
 
-      // API supports either success or {error:{...}}
       if (json?.error) {
         setStatus(json.error.message || "RAG failed.");
         setRaw(json);
         return;
       }
 
-      setStatus(meta?.retried ? "Done (after warmup retry)." : "Done.");
+      setStatus(meta?.retried ? "Done (after retry)." : "Done.");
       setAnswer(json?.answer || "");
       setSources(Array.isArray(json?.sources) ? json.sources : []);
       setRaw(json);
     } catch (e) {
-      const msg = String(e?.message || e);
-      setStatus(msg);
-      setRaw({ error: { code: "CLIENT_EXCEPTION", message: msg } });
+      setStatus(String(e?.message || e));
+      setRaw({ error: { code: "CLIENT_EXCEPTION", message: String(e?.message || e) } });
     } finally {
       setLoading(false);
     }
   }
 
   function onKeyDown(e) {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-      onAsk();
-    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") onAsk();
   }
 
   return (
@@ -210,14 +209,7 @@ export default function AskRunbooks() {
         }}
       />
 
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-          marginTop: 12,
-        }}
-      >
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 12 }}>
         <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
           Top K:
           <input
@@ -279,9 +271,7 @@ export default function AskRunbooks() {
                     {typeof s.chunk !== "undefined" && s.chunk !== null ? (
                       <span style={{ opacity: 0.8 }}> (chunk {s.chunk})</span>
                     ) : null}
-                    {s.s3_key ? (
-                      <span style={{ opacity: 0.7 }}> — {s.s3_key}</span>
-                    ) : null}
+                    {s.s3_key ? <span style={{ opacity: 0.7 }}> — {s.s3_key}</span> : null}
                   </li>
                 ))}
               </ul>
