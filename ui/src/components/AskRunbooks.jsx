@@ -4,14 +4,19 @@ import React, { useMemo, useState } from "react";
 /**
  * POST JSON with a single "soft retry" when the first response is likely
  * a CloudFront/Origin HTML error page (504/502/etc) or otherwise non-JSON.
+ *
+ * ✅ UX fix:
+ * - If first attempt looks like HTML / non-JSON warmup, do NOT show scary error.
+ * - Show "Warming up… retrying once" and only error if retry also fails.
  */
 async function postJsonWithSoftRetry(
   url,
   body,
   {
-    retryDelayMs = 800,
+    retryDelayMs = 900,
     retryOnStatuses = [502, 503, 504],
     retryOnNonJson = true,
+    onWarmup, // optional callback for UI status updates
   } = {}
 ) {
   async function attempt() {
@@ -58,24 +63,27 @@ async function postJsonWithSoftRetry(
   }
 
   // Attempt #1
-  let out = await attempt();
-  if (out.res.ok && out.json) return out;
+  const first = await attempt();
+  if (first.res.ok && first.json) return { ...first, meta: { ...first.meta, retried: false } };
 
-  // Soft retry once (only if it looks like a transient HTML/non-JSON issue or 5xx warmup)
-  if (out.meta.shouldRetry) {
+  // Soft retry once if it looks like warmup / HTML / non-JSON / 5xx
+  if (first.meta.shouldRetry) {
+    if (typeof onWarmup === "function") {
+      onWarmup(first); // let UI update status before waiting
+    }
+
     await new Promise((r) => setTimeout(r, retryDelayMs));
-    const out2 = await attempt();
 
-    // If retry succeeded, return it; otherwise return the second attempt (more recent)
-    if (out2.res.ok && out2.json) return out2;
-    return {
-      ...out2,
-      meta: { ...out2.meta, retried: true, firstAttempt: out.meta },
-    };
+    const second = await attempt();
+    if (second.res.ok && second.json) {
+      return { ...second, meta: { ...second.meta, retried: true, firstAttempt: first.meta } };
+    }
+
+    return { ...second, meta: { ...second.meta, retried: true, firstAttempt: first.meta } };
   }
 
   // No retry performed
-  return { ...out, meta: { ...out.meta, retried: false } };
+  return { ...first, meta: { ...first.meta, retried: false } };
 }
 
 export default function AskRunbooks() {
@@ -110,25 +118,28 @@ export default function AskRunbooks() {
     try {
       const payload = { question: q, top_k: Number(topK) || 5 };
 
-      // Call with soft retry
       const { res, json, rawText, meta } = await postJsonWithSoftRetry(
         "/api/runbooks/ask",
         payload,
-        { retryDelayMs: 900 }
+        {
+          retryDelayMs: 900,
+          onWarmup: (firstAttempt) => {
+            // ✅ key UX change: don't show scary HTML error on first attempt
+            const code = firstAttempt?.res?.status;
+            setStatus(`Warming up backend… Retrying${code ? ` (HTTP ${code})` : ""}`);
+          },
+        }
       );
 
-      // Helpful status note if we retried
-      if (meta?.retried) {
-        setStatus("Backend warmed up — retry succeeded (or attempted).");
-      }
-
-      // If still not OK or not JSON, show a friendly error
+      // If still not OK or not JSON after retry, show a friendly error
       if (!res.ok || !json) {
+        const contentType = meta?.contentType || "";
+        const looksHtml = meta?.looksLikeHtml || contentType.includes("text/html");
+
         const msg =
-          json?.error?.message ||
-          json?.message ||
-          (meta?.looksLikeHtml
-            ? `Expected JSON but got "text/html". This usually means CloudFront/Origin returned HTML (cold start/timeout). (HTTP ${res.status})`
+          (json?.error?.message || json?.message) ??
+          (looksHtml
+            ? `Backend still warming up: expected JSON but got HTML. Please try again. (HTTP ${res.status})`
             : `Request failed (HTTP ${res.status}).`);
 
         setStatus(msg);
@@ -141,8 +152,9 @@ export default function AskRunbooks() {
               message: msg,
               httpStatus: res.status,
               contentType: meta?.contentType || null,
-              retried: meta?.retried || false,
+              retried: !!meta?.retried,
               rawPreview: (rawText || "").slice(0, 800),
+              firstAttempt: meta?.firstAttempt || null,
             },
           }
         );
@@ -156,13 +168,14 @@ export default function AskRunbooks() {
         return;
       }
 
-      setStatus(meta?.retried ? "Done (after retry)." : "Done.");
+      setStatus(meta?.retried ? "Done (after warmup retry)." : "Done.");
       setAnswer(json?.answer || "");
       setSources(Array.isArray(json?.sources) ? json.sources : []);
       setRaw(json);
     } catch (e) {
-      setStatus(String(e?.message || e));
-      setRaw({ error: { code: "CLIENT_EXCEPTION", message: String(e?.message || e) } });
+      const msg = String(e?.message || e);
+      setStatus(msg);
+      setRaw({ error: { code: "CLIENT_EXCEPTION", message: msg } });
     } finally {
       setLoading(false);
     }
@@ -228,6 +241,7 @@ export default function AskRunbooks() {
             color: loading ? "#333" : "#fff",
             cursor: canAsk ? "pointer" : "not-allowed",
           }}
+          type="button"
         >
           {loading ? "Asking…" : "Ask"}
         </button>

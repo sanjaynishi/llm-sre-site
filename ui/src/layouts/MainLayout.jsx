@@ -1,14 +1,18 @@
 // ui/src/layouts/MainLayout.jsx
 import React from "react";
 import AppHeader from "../components/AppHeader";
+import WarmupPing from "../components/WarmupPing"; // ✅ ADD
 
 export default function MainLayout({ children }) {
   return (
     <div style={styles.page}>
       <div style={styles.shell}>
+        {/* 🔥 Warm backend once on initial load */}
+        <WarmupPing />
+
         <AppHeader />
 
-        {/* CENTERING FIX */}
+        {/* CENTERED CONTENT */}
         <main style={styles.main}>
           <section style={styles.centerWrap}>
             {children}
@@ -39,12 +43,12 @@ const styles = {
   main: {
     marginTop: 16,
     display: "flex",
-    justifyContent: "center",   // ⬅️ key
+    justifyContent: "center",
   },
 
   centerWrap: {
     width: "100%",
-    maxWidth: 980,              // ⬅️ visual center
+    maxWidth: 980,
     background: "#ffffff",
     border: "1px solid #e5e7eb",
     borderRadius: 18,
