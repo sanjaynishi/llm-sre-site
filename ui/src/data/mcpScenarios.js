@@ -5,7 +5,7 @@ export const MCP_SCENARIOS = [
       key: "first-call-html",
       title: "MCP: First-call HTML / JSON error (CloudFront 504)",
       description:
-        "Diagnose why the first API call sometimes returns HTML or 504 instead of JSON, and explain why retry succeeds.",
+        "Diagnose why the first API call sometimes returns HTML/504 instead of JSON, and show why a retry succeeds.",
       question:
         "Prove why the first click sometimes returns HTML/504 instead of JSON, then show the retry path and recommended mitigations.",
       request: (baseUrl) => ({
@@ -13,13 +13,13 @@ export const MCP_SCENARIOS = [
         base_url: baseUrl,
       }),
       expectedSteps: [
-        "Create execution plan (LLM)",
+        "Create execution plan",
         "Probe /api/health",
         "POST /api/runbooks/ask (initial)",
-        "Detect HTML/non-JSON or timeout",
-        "Retry strategy (small backoff)",
-        "POST /api/runbooks/ask (retry)",
-        "Root-cause + mitigations (LLM summary)",
+        "Detect HTML or timeout",
+        "Retry with adjusted strategy",
+        "Explain CloudFront + Lambda cold-start behavior",
+        "Recommend mitigations",
       ],
     },
   
@@ -32,16 +32,21 @@ export const MCP_SCENARIOS = [
         "Explain quantum computing for an SRE audience, validate claims vs reality, compare classical vs quantum, and produce a safe 10-step learning and experimentation plan.",
       request: (baseUrl) => ({
         scenario: "quantum-sre-10",
-        base_url: baseUrl, // ✅ important
+        base_url: baseUrl, // ✅ always include so backend tools use same domain
         audience: "sre",
         intent: "education",
       }),
       expectedSteps: [
-        "Create execution plan (LLM)",
-        "10-step learning + experimentation plan",
-        "Clear what quantum is NOT",
-        "Practical SRE analogies",
-        "Risks and next actions (LLM summary)",
+        "Define goal and constraints",
+        "Clarify what quantum is NOT",
+        "Explain qubits and superposition",
+        "Explain entanglement practically",
+        "Compare classical vs quantum workloads",
+        "Identify real enterprise use-cases",
+        "Identify anti-patterns",
+        "Choose safe simulators",
+        "Design learning roadmap",
+        "Summarize risks and next steps",
       ],
     },
   ];
