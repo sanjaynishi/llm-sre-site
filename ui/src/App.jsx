@@ -34,16 +34,20 @@ export default function App() {
 
   const [active, setActive] = useState("home");
 
+  // ✅ Pages that already have their own full-page layout (avoid “double card”)
+  const noWrapper = active === "home" || active === "runbooks";
+
   return (
     <MainLayout>
       <NavTabs tabs={tabs} active={active} onChange={setActive} />
 
-      {/* ✅ Home renders without the outer contentCard (prevents “double card”) */}
-      {active === "home" ? (
-        <Home onNavigate={setActive} />
+      {noWrapper ? (
+        <>
+          {active === "home" && <Home onNavigate={setActive} />}
+          {active === "runbooks" && <Runbooks />}
+        </>
       ) : (
         <div style={contentCard}>
-          {active === "runbooks" && <Runbooks />}
           {active === "rag" && <Rag />}
           {active === "agents" && <Agents />}
           {active === "aiNews" && <AiNews />}
