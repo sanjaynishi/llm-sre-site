@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 
+import Home from "./pages/Home";
 import MainLayout from "./layouts/MainLayout";
 import NavTabs from "./components/NavTabs";
 
@@ -21,22 +22,25 @@ const contentCard = {
 export default function App() {
   const tabs = useMemo(
     () => [
+      { key: "home", label: "Home" },          // 👈 NEW (first tab)
       { key: "runbooks", label: "Runbooks" },
       { key: "rag", label: "RAG Chat" },
       { key: "agents", label: "Agentic AI" },
       { key: "aiNews", label: "AI News" },
-      { key: "mcp", label: "MCP Workflow" }, // ✅ new tab
+      { key: "mcp", label: "MCP Workflow" },
     ],
     []
   );
 
-  const [active, setActive] = useState("runbooks");
+  // Home is now the default landing view
+  const [active, setActive] = useState("home");
 
   return (
     <MainLayout>
       <NavTabs tabs={tabs} active={active} onChange={setActive} />
 
       <div style={contentCard}>
+        {active === "home" && <Home onNavigate={setActive} />}
         {active === "runbooks" && <Runbooks />}
         {active === "rag" && <Rag />}
         {active === "agents" && <Agents />}
