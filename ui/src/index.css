@@ -43,26 +43,40 @@
     margin: 0;
     padding: 0;
   
-    /* 🔑 CRITICAL: prevents left/right cutoff on mobile */
+    /* ✅ Prevent sideways scrollbars */
     overflow-x: hidden;
   }
   
   /* =========================
-     App Root (CRITICAL)
+     App Root (CRITICAL FIX)
      ========================= */
   
+  /*
+    ✅ IMPORTANT CHANGE:
+    Do NOT center the entire app using #root flex.
+    That causes iPhone to crop BOTH sides when any child overflows even slightly.
+  */
   #root {
     min-height: 100vh;
     width: 100%;
     max-width: 100%;
-  
-    /* 🔑 Prevent horizontal overflow from children */
     overflow-x: hidden;
   
-    /* Layout behavior (unchanged) */
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
+    /* ✅ Use normal flow (no flex centering) */
+    display: block;
+  }
+  
+  /* ✅ Utility class you can use in layouts if needed */
+  .safe-page {
+    width: 100%;
+    max-width: 1100px;
+    margin: 0 auto;
+  
+    /* iPhone notch safe-area friendly */
+    padding-left: calc(16px + env(safe-area-inset-left));
+    padding-right: calc(16px + env(safe-area-inset-right));
+    padding-top: calc(12px + env(safe-area-inset-top));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
   
   /* =========================
@@ -139,7 +153,7 @@
     background: #f3f4f6;
     border: 1px solid #e5e7eb;
     transition: all 0.15s ease;
-    white-space: nowrap; /* ✅ prevents text wrap causing overflow */
+    white-space: nowrap;
   }
   
   .nav-tab:hover {
