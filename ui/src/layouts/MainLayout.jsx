@@ -9,13 +9,14 @@ export default function MainLayout({ children }) {
       <WarmupPing />
 
       <div style={styles.shell}>
-        {/* Header should always be visible on iPhone */}
-        <header style={styles.headerWrap}>
+        {/* ✅ Header card uses SAME width + SAME frame style as main content */}
+        <header style={styles.frame}>
           <AppHeader />
         </header>
 
-        <main style={styles.main}>
-          <section style={styles.centerWrap}>{children}</section>
+        {/* ✅ Main content uses SAME width + SAME frame style */}
+        <main style={{ marginTop: 12 }}>
+          <section style={styles.frame}>{children}</section>
         </main>
       </div>
     </div>
@@ -27,10 +28,6 @@ const styles = {
     minHeight: "100vh",
     background: "#f3f4f6",
     width: "100%",
-
-    // ✅ keep layout stable on mobile
-    display: "flex",
-    justifyContent: "center",
   },
 
   shell: {
@@ -38,7 +35,7 @@ const styles = {
     maxWidth: 1100,
     margin: "0 auto",
 
-    // ✅ iPhone notch safe-area
+    // ✅ iPhone notch safe-area + consistent padding
     paddingLeft: "calc(16px + env(safe-area-inset-left))",
     paddingRight: "calc(16px + env(safe-area-inset-right))",
     paddingTop: "calc(14px + env(safe-area-inset-top))",
@@ -50,18 +47,8 @@ const styles = {
       '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif',
   },
 
-  headerWrap: {
-    width: "100%",
-    // ✅ prevent header getting clipped by any nested overflow rules
-    overflow: "visible",
-  },
-
-  main: {
-    marginTop: 12,
-    width: "100%",
-  },
-
-  centerWrap: {
+  // ✅ ONE shared frame style for BOTH header and content (same width)
+  frame: {
     width: "100%",
     maxWidth: 980,
     margin: "0 auto",
@@ -73,7 +60,7 @@ const styles = {
     padding: 16,
     boxShadow: "0 10px 22px rgba(17, 24, 39, 0.06)",
 
-    // ✅ CRITICAL: do NOT hide overflow here (it breaks tab scrolling + some layouts)
+    // ✅ do not clip children (important for tabs / header wrap)
     overflow: "visible",
   },
 };
