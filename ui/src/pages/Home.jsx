@@ -81,13 +81,18 @@ export default function Home({ onNavigate }) {
             letterSpacing: "-0.03em",
           }}
         >
-            {window.location.hostname}
-
+          {window.location.hostname}
         </h1>
 
         <div style={{ marginTop: 8, fontSize: 16, ...muted, lineHeight: 1.5 }}>
           My personal lab for running GenAI platforms like real production systems —
           with automation-first thinking, safe patterns, and reusable runbooks.
+        </div>
+
+        {/* ✅ Fun but professional line (new) */}
+        <div style={{ marginTop: 6, fontSize: 14, ...muted }}>
+          Built with React (Vite) and Python, using AI as a co-pilot — because even engineers
+          appreciate a smart second brain.
         </div>
 
         <div
@@ -110,7 +115,7 @@ export default function Home({ onNavigate }) {
         </div>
       </div>
 
-      {/* WHAT IS SRE / AI-ML / LLMs (FUNNY + PROFESSIONAL) */}
+      {/* WHAT IS SRE / AI-ML / LLMs */}
       <div style={{ marginTop: 16, ...card }}>
         <div style={{ fontSize: 18, fontWeight: 950 }}>What this site is about</div>
 
@@ -160,7 +165,7 @@ export default function Home({ onNavigate }) {
         />
       </div>
 
-      {/* QUICK LINKS (FLAT) */}
+      {/* QUICK LINKS */}
       <div style={{ marginTop: 16, ...card }}>
         <div style={{ fontSize: 16, fontWeight: 950 }}>Jump to</div>
         <div style={{ marginTop: 6, fontSize: 13, ...muted }}>
