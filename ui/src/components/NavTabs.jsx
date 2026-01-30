@@ -2,37 +2,38 @@
 import React from "react";
 
 /**
- * Mobile-friendly NavTabs:
- * - Uses horizontal scroll on small screens (prevents LHS cut / overflow)
- * - Wraps nicely on larger screens
- * - Keeps your existing look & feel (gradients, active styling)
+ * iPhone-friendly tabs:
+ * - horizontal scroll (pan-x)
+ * - starts from left (not centered) so you can reach all buttons
+ * - still looks same (your gradients/active styles)
  */
 
 const wrapStyle = {
   marginTop: 16,
+  width: "100%",
 
-  /* ✅ Mobile: allow horizontal scroll instead of layout overflow */
   overflowX: "auto",
   overflowY: "hidden",
   WebkitOverflowScrolling: "touch",
 
-  /* A little breathing room so scrollbars (if any) don't overlap */
-  paddingBottom: 6,
+  // iOS scrolling reliability
+  touchAction: "pan-x",
 };
 
 const rowStyle = {
   display: "flex",
-  justifyContent: "center",
   gap: 10,
   alignItems: "center",
 
-  /* ✅ Prevent tabs from forcing page wider than viewport */
-  flexWrap: "nowrap",
-  minWidth: "max-content",
+  // ✅ Start from left so user can scroll to the right
+  justifyContent: "flex-start",
 
-  /* Small padding so first/last tab isn't flush to edges */
-  paddingLeft: 10,
-  paddingRight: 10,
+  // ✅ Keep on one line (scroll instead of wrapping)
+  flexWrap: "nowrap",
+  width: "max-content",
+
+  paddingLeft: 6,
+  paddingRight: 6,
 };
 
 const tabBase = {
@@ -43,8 +44,8 @@ const tabBase = {
   color: "#111827",
   fontWeight: 800,
   cursor: "pointer",
-  whiteSpace: "nowrap", // ✅ keep labels on one line
-  flex: "0 0 auto",     // ✅ never shrink, never wrap
+  whiteSpace: "nowrap",
+  flex: "0 0 auto",
 };
 
 const tabActive = {

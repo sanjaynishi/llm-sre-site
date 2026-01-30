@@ -1,18 +1,19 @@
 // ui/src/layouts/MainLayout.jsx
 import React from "react";
 import AppHeader from "../components/AppHeader";
-import WarmupPing from "../components/WarmupPing"; // ✅ ADD
+import WarmupPing from "../components/WarmupPing";
 
 export default function MainLayout({ children }) {
   return (
     <div style={styles.page}>
+      <WarmupPing />
+
       <div style={styles.shell}>
-        {/* 🔥 Warm backend once on initial load */}
-        <WarmupPing />
+        {/* Header should always be visible on iPhone */}
+        <header style={styles.headerWrap}>
+          <AppHeader />
+        </header>
 
-        <AppHeader />
-
-        {/* CONTENT */}
         <main style={styles.main}>
           <section style={styles.centerWrap}>{children}</section>
         </main>
@@ -25,35 +26,38 @@ const styles = {
   page: {
     minHeight: "100vh",
     background: "#f3f4f6",
-
-    /* ✅ iPhone-safe: do NOT flex-center the whole page */
     width: "100%",
-    overflowX: "hidden",
+
+    // ✅ keep layout stable on mobile
+    display: "flex",
+    justifyContent: "center",
   },
 
   shell: {
-    /* ✅ Always fit viewport */
     width: "100%",
     maxWidth: 1100,
     margin: "0 auto",
 
-    /* ✅ Notch-safe padding on iPhone + normal padding everywhere */
+    // ✅ iPhone notch safe-area
     paddingLeft: "calc(16px + env(safe-area-inset-left))",
     paddingRight: "calc(16px + env(safe-area-inset-right))",
-    paddingTop: "calc(18px + env(safe-area-inset-top))",
-    paddingBottom: "calc(30px + env(safe-area-inset-bottom))",
+    paddingTop: "calc(14px + env(safe-area-inset-top))",
+    paddingBottom: "calc(26px + env(safe-area-inset-bottom))",
 
     boxSizing: "border-box",
-
+    color: "#111827",
     fontFamily:
       '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Arial, sans-serif',
-    color: "#111827",
+  },
+
+  headerWrap: {
+    width: "100%",
+    // ✅ prevent header getting clipped by any nested overflow rules
+    overflow: "visible",
   },
 
   main: {
-    marginTop: 16,
-
-    /* ✅ Keep layout simple & mobile-safe */
+    marginTop: 12,
     width: "100%",
   },
 
@@ -61,9 +65,6 @@ const styles = {
     width: "100%",
     maxWidth: 980,
     margin: "0 auto",
-
-    /* ✅ Prevent child overflow from cropping the page */
-    overflowX: "hidden",
     boxSizing: "border-box",
 
     background: "#ffffff",
@@ -71,5 +72,8 @@ const styles = {
     borderRadius: 18,
     padding: 16,
     boxShadow: "0 10px 22px rgba(17, 24, 39, 0.06)",
+
+    // ✅ CRITICAL: do NOT hide overflow here (it breaks tab scrolling + some layouts)
+    overflow: "visible",
   },
 };

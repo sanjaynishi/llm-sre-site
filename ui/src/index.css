@@ -177,3 +177,15 @@
       background-color: #f3f4f6;
     }
   }
+
+  /* Prevent media/text from forcing horizontal overflow on mobile */
+  img, video, canvas, svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* If any page prints long text or code, allow it to scroll inside */
+  pre, code {
+    max-width: 100%;
+    overflow-x: auto;
+  }
