@@ -38,9 +38,13 @@
   html,
   body {
     width: 100%;
+    max-width: 100%;
     height: 100%;
     margin: 0;
     padding: 0;
+  
+    /* 🔑 CRITICAL: prevents left/right cutoff on mobile */
+    overflow-x: hidden;
   }
   
   /* =========================
@@ -50,8 +54,12 @@
   #root {
     min-height: 100vh;
     width: 100%;
+    max-width: 100%;
   
-    /* 🔑 This enables proper centering */
+    /* 🔑 Prevent horizontal overflow from children */
+    overflow-x: hidden;
+  
+    /* Layout behavior (unchanged) */
     display: flex;
     justify-content: center;
     align-items: flex-start;
@@ -119,7 +127,7 @@
   }
   
   /* =========================
-     Nav Tabs (kept from your file)
+     Nav Tabs (styling preserved)
      ========================= */
   
   .nav-tab {
@@ -131,6 +139,7 @@
     background: #f3f4f6;
     border: 1px solid #e5e7eb;
     transition: all 0.15s ease;
+    white-space: nowrap; /* ✅ prevents text wrap causing overflow */
   }
   
   .nav-tab:hover {
