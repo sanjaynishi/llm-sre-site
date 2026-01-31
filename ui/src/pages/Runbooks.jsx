@@ -45,6 +45,16 @@ const btnSecondary = {
   cursor: "pointer",
 };
 
+const btnDanger = {
+  padding: "10px 14px",
+  borderRadius: 12,
+  border: "1px solid #fecaca",
+  background: "#fff",
+  color: "#991b1b",
+  fontWeight: 900,
+  cursor: "pointer",
+};
+
 const btnDisabled = {
   opacity: 0.6,
   cursor: "not-allowed",
@@ -60,6 +70,41 @@ const pre = {
   overflowX: "auto",
   fontSize: 13,
   lineHeight: 1.35,
+};
+
+// ✅ pretty retry panel styles
+const retryCard = {
+  marginTop: 12,
+  borderRadius: 14,
+  border: "1px solid #fee2e2",
+  background: "#fff7f7",
+  padding: 12,
+  display: "flex",
+  gap: 12,
+  alignItems: "flex-start",
+};
+
+const retryIcon = {
+  width: 34,
+  height: 34,
+  borderRadius: 12,
+  background: "#fee2e2",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: "#991b1b",
+  fontWeight: 1000,
+  flex: "0 0 auto",
+};
+
+const retryTitle = { fontWeight: 950, color: "#991b1b", marginBottom: 4 };
+const retryText = { color: "#7f1d1d", lineHeight: 1.35, fontSize: 13 };
+
+const retryActions = {
+  marginTop: 10,
+  display: "flex",
+  gap: 10,
+  flexWrap: "wrap",
 };
 
 function safeJsonParse(text) {
@@ -80,7 +125,6 @@ function firstChars(str, n = 200) {
 }
 
 export default function Runbooks() {
-  // ✅ Add as many predefined questions as you want here
   const QUESTIONS = useMemo(
     () => [
       // --- CloudFront / UI ---
@@ -156,7 +200,7 @@ export default function Runbooks() {
         question: "How do I prevent secrets exposure in Lambda env vars and logs?",
       },
 
-      // --- Quantum (answered only if your runbooks contain this info) ---
+      // --- Quantum ---
       {
         id: "quantum_qubit",
         label: "Quantum: What is a qubit vs a classical bit?",
@@ -195,15 +239,38 @@ export default function Runbooks() {
 
   const [loading, setLoading] = useState(false);
 
-  // ✅ retry UI state
+  // ✅ retry system
   const [lastPayload, setLastPayload] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
 
+  // ✅ pretty retry message state (only shown on failures)
+  const [retryUi, setRetryUi] = useState({
+    show: false,
+    title: "",
+    detail: "",
+    hint: "",
+  });
+
   const selected = QUESTIONS.find((q) => q.id === qid) || QUESTIONS[0];
 
+  function hideRetryUi() {
+    setRetryUi({ show: false, title: "", detail: "", hint: "" });
+  }
+
+  function showRetryUi({ title, detail, hint }) {
+    setRetryUi({
+      show: true,
+      title: title || "Temporary issue reaching the API",
+      detail: detail || "",
+      hint:
+        hint ||
+        "Try Retry. If it keeps happening, it’s usually CloudFront routing to S3 (HTML) instead of the API, or a Lambda-side error.",
+    });
+  }
+
   async function postJsonWithRetry(url, payload, opts = {}) {
-    const attempts = Math.min(6, Math.max(1, Number(opts.attempts || 4))); // 4 attempts default
-    const baseDelayMs = Math.min(4000, Math.max(150, Number(opts.baseDelayMs || 450))); // backoff base
+    const attempts = Math.min(6, Math.max(1, Number(opts.attempts || 4)));
+    const baseDelayMs = Math.min(4000, Math.max(150, Number(opts.baseDelayMs || 450)));
     const timeoutMs = Math.min(60000, Math.max(5000, Number(opts.timeoutMs || 25000)));
 
     let lastErr = null;
@@ -214,6 +281,7 @@ export default function Runbooks() {
 
       try {
         setRetryCount(attempt - 1);
+
         if (attempt > 1) {
           setStatus(`Retrying… (attempt ${attempt}/${attempts})`);
         }
@@ -228,12 +296,10 @@ export default function Runbooks() {
         const contentType = res.headers.get("content-type") || "";
         const text = await res.text();
 
-        // If CloudFront/S3 returns HTML (or any non-json), treat as retryable for early attempts
         if (!contentType.includes("application/json")) {
           const msg =
             `Expected JSON but got "${contentType || "unknown"}". ` +
-            `First 200 chars: ${firstChars(text, 200)}`;
-
+            `Preview: ${firstChars(text, 200)}`;
           const err = new Error(msg);
           err._retryable = true;
           err._status = res.status;
@@ -242,7 +308,7 @@ export default function Runbooks() {
 
         const parsed = safeJsonParse(text);
         if (!parsed.ok) {
-          const err = new Error(`Response not valid JSON. First 200 chars: ${firstChars(text, 200)}`);
+          const err = new Error(`Response not valid JSON. Preview: ${firstChars(text, 200)}`);
           err._retryable = true;
           err._status = res.status;
           throw err;
@@ -250,12 +316,10 @@ export default function Runbooks() {
 
         const data = parsed.data;
 
-        // API returned an error object
         if (!res.ok || data?.error) {
           const apiMsg = data?.error?.message || `HTTP ${res.status}`;
           const err = new Error(apiMsg);
 
-          // Retry only on transient statuses (typical CloudFront/API/Lambda blips)
           const retryableStatus = [408, 429, 500, 502, 503, 504];
           err._retryable = retryableStatus.includes(res.status);
           err._status = res.status;
@@ -269,12 +333,10 @@ export default function Runbooks() {
         clearTimeout(timer);
         lastErr = e;
 
-        // aborts are usually transient
         const aborted = e?.name === "AbortError";
         const retryable = aborted || e?._retryable === true;
 
         if (attempt < attempts && retryable) {
-          // simple exponential backoff + small jitter
           const jitter = Math.floor(Math.random() * 180);
           const delay = Math.min(6000, baseDelayMs * Math.pow(2, attempt - 1)) + jitter;
           await sleep(delay);
@@ -288,22 +350,18 @@ export default function Runbooks() {
     return { ok: false, error: lastErr };
   }
 
-  async function onAsk() {
-    if (!selected?.question) {
-      setStatus("Pick a question.");
-      return;
-    }
-
-    const k = Math.min(10, Math.max(1, Number(topK) || 5));
-
-    const payload = { question: selected.question, top_k: k };
+  async function runAsk(payload, modeLabel = "Asking…") {
     setLastPayload(payload);
 
     setLoading(true);
     setRetryCount(0);
-    setStatus("Asking…");
+    setStatus(modeLabel);
+
     setAnswer("");
     setSources([]);
+
+    // start clean
+    hideRetryUi();
 
     const result = await postJsonWithRetry("/api/runbooks/ask", payload, {
       attempts: 4,
@@ -314,18 +372,37 @@ export default function Runbooks() {
     try {
       if (!result.ok) {
         const msg = result?.error?.message || String(result?.error || "Unknown error");
-        setStatus(`Error: ${msg}`);
+        setStatus("Error");
+
+        showRetryUi({
+          title: "Couldn’t reach the Runbooks API cleanly",
+          detail: msg,
+          hint:
+            "Retry usually works if CloudFront is warming up. If it keeps returning HTML, check CloudFront behavior for /api/*.",
+        });
         return;
       }
 
       const data = result.data;
 
+      // ✅ Success: hide retry UI automatically
+      hideRetryUi();
+
       setAnswer(data?.answer || "");
       setSources(Array.isArray(data?.sources) ? data.sources : []);
-      setStatus(retryCount > 0 ? `Done. (retries: ${retryCount})` : "Done.");
+      setStatus("Done.");
     } finally {
       setLoading(false);
     }
+  }
+
+  async function onAsk() {
+    if (!selected?.question) {
+      setStatus("Pick a question.");
+      return;
+    }
+    const k = Math.min(10, Math.max(1, Number(topK) || 5));
+    await runAsk({ question: selected.question, top_k: k }, "Asking…");
   }
 
   async function onRetryNow() {
@@ -333,36 +410,8 @@ export default function Runbooks() {
       setStatus("Nothing to retry yet. Click Ask first.");
       return;
     }
-
-    setLoading(true);
-    setRetryCount(0);
-    setStatus("Retrying…");
-    setAnswer("");
-    setSources([]);
-
-    const result = await postJsonWithRetry("/api/runbooks/ask", lastPayload, {
-      attempts: 4,
-      baseDelayMs: 450,
-      timeoutMs: 25000,
-    });
-
-    try {
-      if (!result.ok) {
-        const msg = result?.error?.message || String(result?.error || "Unknown error");
-        setStatus(`Error: ${msg}`);
-        return;
-      }
-
-      const data = result.data;
-      setAnswer(data?.answer || "");
-      setSources(Array.isArray(data?.sources) ? data.sources : []);
-      setStatus(retryCount > 0 ? `Done. (retries: ${retryCount})` : "Done.");
-    } finally {
-      setLoading(false);
-    }
+    await runAsk(lastPayload, "Retrying…");
   }
-
-  const isError = status.startsWith("Error");
 
   return (
     <div style={card}>
@@ -416,19 +465,43 @@ export default function Runbooks() {
         </div>
       </div>
 
+      {/* Status line */}
       {status ? (
-        <div
-          style={{
-            marginTop: 10,
-            color: isError ? "#b91c1c" : "#374151",
-          }}
-        >
+        <div style={{ marginTop: 10, color: "#374151" }}>
           {status}
           {loading ? null : retryCount > 0 ? (
             <span style={{ marginLeft: 8, color: "#6b7280" }}>
-              (attempted retries: {retryCount})
+              (retries attempted: {retryCount})
             </span>
           ) : null}
+        </div>
+      ) : null}
+
+      {/* ✅ Pretty retry panel (auto-hides on success) */}
+      {retryUi.show ? (
+        <div style={retryCard}>
+          <div style={retryIcon}>!</div>
+          <div style={{ flex: 1 }}>
+            <div style={retryTitle}>{retryUi.title}</div>
+            {retryUi.detail ? <div style={retryText}>{retryUi.detail}</div> : null}
+            {retryUi.hint ? (
+              <div style={{ ...retryText, marginTop: 6, color: "#6b7280" }}>{retryUi.hint}</div>
+            ) : null}
+
+            <div style={retryActions}>
+              <button
+                onClick={onRetryNow}
+                style={{ ...btn, ...(loading ? btnDisabled : {}) }}
+                disabled={loading || !lastPayload}
+              >
+                {loading ? "Retrying…" : "Retry now"}
+              </button>
+
+              <button onClick={hideRetryUi} style={btnDanger} disabled={loading}>
+                Dismiss
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -450,14 +523,6 @@ export default function Runbooks() {
             </div>
           ) : null}
         </>
-      ) : null}
-
-      {/* Small helpful hint only when errors happen */}
-      {isError ? (
-        <div style={{ marginTop: 10, color: "#6b7280", fontSize: 12, lineHeight: 1.35 }}>
-          Tip: If you see HTML instead of JSON, it’s usually a CloudFront routing/cache mismatch.
-          The Retry button replays the last request without changing your selection.
-        </div>
       ) : null}
     </div>
   );
