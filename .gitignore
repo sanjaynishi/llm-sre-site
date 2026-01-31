@@ -1,26 +1,42 @@
+# =========================
 # Terraform (DO NOT COMMIT)
+# =========================
 **/.terraform/*
 **/*.tfstate
 **/*.tfstate.*
-crash.log
-*.tfvars
 terraform.tfstate.backup
+*.tfvars
+*.tfplan
+crash.log
 
-# Node
+# =========================
+# Node / Frontend
+# =========================
 **/node_modules/
 **/dist/
 
-# Secrets
+# =========================
+# Secrets & Environments
+# =========================
 .env
 .env.*
 .venv
 .venv/*
 
+# =========================
+# Python
+# =========================
 __pycache__/
 *.pyc
 **/__pycache__/*
+build/
+dist/
+*.egg-info/
+*.log
 
-# Local Chroma / RAG artifacts (do not commit)
+# =========================
+# Local Chroma / RAG artifacts
+# =========================
 chroma_store/
 scripts/chroma_store/
 .rag_tmp/
@@ -31,5 +47,7 @@ scripts/.rag_tmp/
 **/length.bin
 **/link_lists.bin
 
+# =========================
 # macOS
+# =========================
 .DS_Store
