@@ -1,8 +1,30 @@
-openai>=1.6.0
-boto3>=1.28.0
-botocore>=1.31.0
+#openai>=1.6.0
+#boto3>=1.28.0
+#botocore>=1.31.0
 
-pysqlite3-binary==0.5.4
+#pysqlite3-binary==0.5.4
+#chromadb==0.5.23
+#numpy==1.26.4
+#pypdf>=4.0.0
+
+# ---------- Core AWS ----------
+boto3==1.34.23
+botocore==1.34.23
+
+# ---------- OpenAI ----------
+# Keep within v1.x to avoid response format breaks
+openai>=1.6.0,<2.0
+
+# ---------- RAG / Vector DB ----------
+# Matches your current Lambda image behavior
 chromadb==0.5.23
+
+# sqlite shim required for Lambda (system sqlite is too old)
+pysqlite3-binary==0.5.4
+
+# ---------- Data / Parsing ----------
 numpy==1.26.4
-pypdf>=4.0.0
+pypdf==4.0.2
+
+# ---------- Telemetry (explicit to avoid runtime mismatch) ----------
+posthog==3.6.0
