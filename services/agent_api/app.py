@@ -26,6 +26,7 @@ import os
 import shutil
 import sys
 from typing import Any, Dict, List, Tuple
+import traceback
 
 from core.request import get_method, get_path, get_body_json
 from core.response import json_response
@@ -650,6 +651,45 @@ def _handle_post_agent_run(event: dict) -> dict:
     return json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
 
+# ---------------- FIX: prevent KeyError '_type' in dev ----------------
+#
+# Symptom you saw:
+#   {"error": {"code":"UNHANDLED","message":"'_type'"}}
+#
+# We do NOT change your API shape or remove any behavior.
+# We add defensive parsing for metadata used when returning "sources".
+def _safe_meta(meta: Any) -> Dict[str, Any]:
+    """
+    Normalize metadata to a dict and make it safe to read fields from.
+    Also tolerates serialized objects that may carry '_type' without requiring it.
+    """
+    if meta is None:
+        return {}
+    if isinstance(meta, dict):
+        return meta
+    try:
+        if isinstance(meta, str) and meta.strip().startswith("{"):
+            obj = json.loads(meta)
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _safe_source_from_context(c: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the 'sources' item safely even if metadata isn't the shape we expect.
+    Preserves the existing output format (file/s3_key/chunk).
+    """
+    meta = _safe_meta(c.get("meta"))
+
+    file_val = meta.get("file")
+    s3_key_val = meta.get("s3_key")
+    chunk_val = meta.get("chunk")
+
+    return {"file": file_val, "s3_key": s3_key_val, "chunk": chunk_val}
+
+
 def _handle_post_runbooks_ask(event: dict) -> dict:
     req = get_body_json(event)
     question = (req.get("question") or "").strip()
@@ -663,20 +703,15 @@ def _handle_post_runbooks_ask(event: dict) -> dict:
     contexts = _retrieve_chunks(question, top_k=top_k)
     answer = _answer_with_llm(question, contexts)
 
+    sources = [_safe_source_from_context(c) for c in contexts]
+
     return json_response(
         event,
         200,
         {
             "question": question,
             "top_k": top_k,
-            "sources": [
-                {
-                    "file": (c.get("meta") or {}).get("file"),
-                    "s3_key": (c.get("meta") or {}).get("s3_key"),
-                    "chunk": (c.get("meta") or {}).get("chunk"),
-                }
-                for c in contexts
-            ],
+            "sources": sources,
             "answer": answer,
         },
     )
@@ -724,7 +759,11 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     except ValueError as e:
         return json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
+    #except Exception as e:
+        ## Keep the same error envelope you already had
+    #    return json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
     except Exception as e:
+        print("UNHANDLED EXCEPTION:\n" + traceback.format_exc())
         return json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
 
 
