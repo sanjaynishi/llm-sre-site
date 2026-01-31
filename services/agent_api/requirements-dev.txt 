@@ -1,0 +1,31 @@
+#
+# Dev requirements for llm-sre-agent-api
+# Dev stays CLOSE to prod, but allows faster iteration and debugging
+#
+
+# ---- Core runtime ----
+python-dateutil>=2.8.2
+
+# ---- AWS ----
+boto3==1.34.23
+botocore==1.34.23
+
+# ---- OpenAI ----
+# 1.x SDK (Responses API compatible)
+openai>=1.6.0,<2.0
+
+# ---- SQLite (CRITICAL for Chroma) ----
+# Lambda base image ships sqlite 3.7.x → NOT supported by Chroma
+# pysqlite3-binary provides sqlite >= 3.35
+pysqlite3-binary==0.5.4.post2
+
+# ---- Vector DB / RAG ----
+chromadb==0.5.23
+numpy==1.26.4
+
+# ---- PDF ingestion ----
+pypdf>=4.0.0
+
+# ---- Dev-only helpers (safe in dev, optional in prod) ----
+# rich logs / debugging (optional)
+rich>=13.7.0

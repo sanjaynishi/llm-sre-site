@@ -38,10 +38,8 @@ from features.mcp.mcp_routes import handle_post_mcp_run  # ✅ MCP handler lives
 # IMPORTANT: chromadb checks sqlite3 version at import time.
 try:
     import pysqlite3.dbapi2 as sqlite3  # type: ignore
-
     sys.modules["sqlite3"] = sqlite3
 except Exception:
-    # If shim isn't available, chromadb import may fail later (surface a clear error).
     pass
 
 # ---- disable Chroma telemetry ----
@@ -169,7 +167,6 @@ def _effective_allowlists() -> Tuple[List[str], List[str]]:
 
 
 # ---------------- Weather + Travel ----------------
-# (kept inline for now; you can modularize next)
 
 import urllib.parse
 import urllib.request
@@ -331,7 +328,6 @@ Return VALID JSON ONLY with this exact structure:
     except Exception:
         return {"error": {"message": "Failed to parse JSON from model", "raw_output": output_text[:1200]}}
 
-    # total sanity
     try:
         c = data.get("estimated_cost_usd", {})
         parts = (
@@ -403,46 +399,57 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     return count
 
 
-# ---------------- FIX: prevent KeyError '_type' when loading Chroma ----------------
+# ---------------- FIX: Chroma config dispatch patch ----------------
 #
-# Your error:
-#   {"error":{"code":"UNHANDLED","message":"'_type'"}}
+# Root cause:
+#   Persisted chroma store has config JSON like:
+#     {"_type":"EmbeddingsQueueConfigurationInternal", ...}
+#   But Chroma tries to deserialize it via ConfigurationInternal.from_json
+#   and errors because _type doesn't match the class being instantiated.
 #
-# This comes from chromadb/api/configuration.py expecting json_map["_type"]
-# when deserializing persisted config objects. Some persisted stores may be
-# missing _type (version mismatch / older store format).
+# We patch ConfigurationInternal.from_json (and Configuration.from_json) to:
+# - read "_type"
+# - find that class inside chromadb.api.configuration
+# - dispatch to that class.from_json
 #
-# Safe approach:
-# - Patch Configuration.from_json / ConfigurationInternal.from_json to supply
-#   a default _type if missing.
-# - Patch is idempotent and never breaks Lambda if chroma changes.
-def _patch_chromadb_missing__type() -> None:
+# This patch is:
+# - idempotent (safe in warm Lambda)
+# - best-effort (never breaks requests if internals change)
+def _patch_chromadb_config_dispatch() -> None:
     try:
         import chromadb.api.configuration as cfg  # type: ignore
 
-        # avoid patching twice (warm lambda)
-        if getattr(cfg, "__missing_type_patched__", False):
+        if getattr(cfg, "__config_dispatch_patched__", False):
             return
-        cfg.__missing_type_patched__ = True
+        cfg.__config_dispatch_patched__ = True
 
-        for cls_name in ("ConfigurationInternal", "Configuration"):
-            C = getattr(cfg, cls_name, None)
-            if C is None or not hasattr(C, "from_json"):
-                continue
+        C = getattr(cfg, "ConfigurationInternal", None)
+        if C is None or not hasattr(C, "from_json"):
+            return
 
-            orig_from_json = C.from_json
+        orig_from_json = C.from_json
 
-            def _wrapped(cls, json_map, _orig=orig_from_json):
-                if isinstance(json_map, dict) and "_type" not in json_map:
-                    json_map = dict(json_map)
-                    json_map["_type"] = cls.__name__
-                return _orig(json_map)
+        def _wrapped(cls, json_map, *args, _orig=orig_from_json, **kwargs):
+            if isinstance(json_map, dict):
+                if "_type" not in json_map:
+                    jm = dict(json_map)
+                    jm["_type"] = "ConfigurationInternal"
+                    return _orig(jm, *args, **kwargs)
 
-            C.from_json = classmethod(_wrapped)
+                t = json_map.get("_type")
+                if isinstance(t, str) and t != "ConfigurationInternal" and t.endswith("ConfigurationInternal"):
+                    jm = dict(json_map)
+                    jm["_type"] = "ConfigurationInternal"
+                    return _orig(jm, *args, **kwargs)
+
+            return _orig(json_map, *args, **kwargs)
+
+        C.from_json = classmethod(_wrapped)
+
+        _log("✅ Chroma config dispatch patch applied")
 
     except Exception as e:
-        # Never fail request because of the patch
-        _log(f"Chroma _type patch skipped: {e}")
+        _log(f"Chroma config dispatch patch skipped: {e}")
 
 
 def _ensure_chroma():
@@ -459,7 +466,6 @@ def _ensure_chroma():
 
     try:
         import chromadb  # type: ignore
-        _patch_chromadb_missing__type()  # ✅ patch right after import (before loading store)
         from chromadb.config import Settings  # type: ignore
     except Exception as e:
         raise RuntimeError(f"chromadb not installed in this Lambda image. Import error: {e}") from e
@@ -578,7 +584,6 @@ def _handle_get_health(event: dict) -> dict:
 
 
 def _handle_get_routes(event: dict, method: str, path: str) -> dict:
-    # Show *normalized* routes (after "/api" is stripped)
     return json_response(
         event,
         200,
@@ -695,8 +700,7 @@ def _handle_post_agent_run(event: dict) -> dict:
 
 
 # ---------------- FIX: defensive parsing for metadata in sources ----------------
-#
-# This is NOT the root cause of the '_type' crash, but it is safe and useful.
+
 def _safe_meta(meta: Any) -> Dict[str, Any]:
     if meta is None:
         return {}
@@ -767,7 +771,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "GET" and (path == "/_debug/news" or path.endswith("/_debug/news")):
             return handle_get_debug_news(event)
 
-        # ✅ after normalization, this MUST be "/news/latest"
         if method == "GET" and (path == "/news/latest" or path.endswith("/news/latest")):
             return handle_get_news_latest(event)
 
@@ -777,18 +780,18 @@ def lambda_handler(event: dict, context: Any) -> dict:
         if method == "POST" and (path == "/runbooks/ask" or path.endswith("/runbooks/ask")):
             return _handle_post_runbooks_ask(event)
 
-        # ✅ MCP route (delegates to features/mcp/mcp_routes.py)
         if method == "POST" and (path == "/mcp/run" or path.endswith("/mcp/run")):
             return handle_post_mcp_run(event)
 
         return json_response(event, 404, {"error": {"code": "NOT_FOUND", "message": f"Route not found: {path}"}})
 
     except ValueError as e:
+        print("BAD_REQUEST EXCEPTION:\n" + traceback.format_exc())
         return json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
+        
     except Exception as e:
         print("UNHANDLED EXCEPTION:\n" + traceback.format_exc())
         return json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
 
 
-# Backward-compatible alias if anything is still configured as "app.handler"
 handler = lambda_handler

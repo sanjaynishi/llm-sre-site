@@ -40,9 +40,9 @@ module "analytics" {
 module "agent_api" {
   source = "../../modules/agent_api"
 
-  env        = var.env
-  aws_region = var.aws_region
-  region      = var.region   # ✅ ADD THIS
+  env         = var.env
+  aws_region  = var.aws_region
+  region      = var.region
 
   name_prefix = var.name_prefix
 
@@ -50,20 +50,19 @@ module "agent_api" {
   openai_api_key = var.openai_api_key
   openai_model   = var.openai_model
 
-  # Container-image Lambda (built/pushed by CI)
+  # Container-image Lambda
   lambda_src_dir   = "${path.module}/../../../services/agent_api"
   lambda_image_uri = var.lambda_image_uri
 
-  # ECR managed by CI (not Terraform)
   manage_ecr = false
 
   agent_config_bucket = var.agent_config_bucket
   agent_config_prefix = var.agent_config_prefix
   s3_prefix           = var.s3_prefix
 
-  # RAG layout (dev)
+  # RAG layout (DEV override)
   runbooks_prefix   = var.runbooks_prefix
-  vectors_prefix    = var.vectors_prefix
+  vectors_prefix    = "knowledge/vectors/dev/chroma_v2/"   # ✅ ADD THIS LINE
   chroma_collection = var.chroma_collection
   embed_model       = var.embed_model
 
