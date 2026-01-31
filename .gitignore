@@ -19,3 +19,17 @@ terraform.tfstate.backup
 __pycache__/
 *.pyc
 **/__pycache__/*
+
+# Local Chroma / RAG artifacts (do not commit)
+chroma_store/
+scripts/chroma_store/
+.rag_tmp/
+scripts/.rag_tmp/
+**/*.sqlite3
+**/data_level*.bin
+**/header.bin
+**/length.bin
+**/link_lists.bin
+
+# macOS
+.DS_Store
