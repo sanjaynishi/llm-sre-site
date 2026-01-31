@@ -67,7 +67,7 @@ from openai import OpenAI
 S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
 S3_PREFIX = os.environ.get("S3_PREFIX", "").lstrip("/").strip()              # e.g. "knowledge"
 RUNBOOKS_PREFIX = os.environ.get("RUNBOOKS_PREFIX", "runbooks/").lstrip("/").strip()  # "runbooks/"
-VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma/").lstrip("/").strip()
+VECTORS_PREFIX = os.environ.get("VECTORS_PREFIX", "knowledge/vectors/dev/chroma_v2/").lstrip("/").strip()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
