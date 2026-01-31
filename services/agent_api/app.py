@@ -403,6 +403,48 @@ def _s3_download_prefix(bucket: str, prefix: str, local_dir: str) -> int:
     return count
 
 
+# ---------------- FIX: prevent KeyError '_type' when loading Chroma ----------------
+#
+# Your error:
+#   {"error":{"code":"UNHANDLED","message":"'_type'"}}
+#
+# This comes from chromadb/api/configuration.py expecting json_map["_type"]
+# when deserializing persisted config objects. Some persisted stores may be
+# missing _type (version mismatch / older store format).
+#
+# Safe approach:
+# - Patch Configuration.from_json / ConfigurationInternal.from_json to supply
+#   a default _type if missing.
+# - Patch is idempotent and never breaks Lambda if chroma changes.
+def _patch_chromadb_missing__type() -> None:
+    try:
+        import chromadb.api.configuration as cfg  # type: ignore
+
+        # avoid patching twice (warm lambda)
+        if getattr(cfg, "__missing_type_patched__", False):
+            return
+        cfg.__missing_type_patched__ = True
+
+        for cls_name in ("ConfigurationInternal", "Configuration"):
+            C = getattr(cfg, cls_name, None)
+            if C is None or not hasattr(C, "from_json"):
+                continue
+
+            orig_from_json = C.from_json
+
+            def _wrapped(cls, json_map, _orig=orig_from_json):
+                if isinstance(json_map, dict) and "_type" not in json_map:
+                    json_map = dict(json_map)
+                    json_map["_type"] = cls.__name__
+                return _orig(json_map)
+
+            C.from_json = classmethod(_wrapped)
+
+    except Exception as e:
+        # Never fail request because of the patch
+        _log(f"Chroma _type patch skipped: {e}")
+
+
 def _ensure_chroma():
     global _chroma_client, _chroma_collection
     if _chroma_collection is not None:
@@ -417,6 +459,7 @@ def _ensure_chroma():
 
     try:
         import chromadb  # type: ignore
+        _patch_chromadb_missing__type()  # ✅ patch right after import (before loading store)
         from chromadb.config import Settings  # type: ignore
     except Exception as e:
         raise RuntimeError(f"chromadb not installed in this Lambda image. Import error: {e}") from e
@@ -651,18 +694,10 @@ def _handle_post_agent_run(event: dict) -> dict:
     return json_response(event, 400, {"error": {"code": "INVALID_AGENT", "message": "Unknown agent_id"}})
 
 
-# ---------------- FIX: prevent KeyError '_type' in dev ----------------
+# ---------------- FIX: defensive parsing for metadata in sources ----------------
 #
-# Symptom you saw:
-#   {"error": {"code":"UNHANDLED","message":"'_type'"}}
-#
-# We do NOT change your API shape or remove any behavior.
-# We add defensive parsing for metadata used when returning "sources".
+# This is NOT the root cause of the '_type' crash, but it is safe and useful.
 def _safe_meta(meta: Any) -> Dict[str, Any]:
-    """
-    Normalize metadata to a dict and make it safe to read fields from.
-    Also tolerates serialized objects that may carry '_type' without requiring it.
-    """
     if meta is None:
         return {}
     if isinstance(meta, dict):
@@ -677,17 +712,8 @@ def _safe_meta(meta: Any) -> Dict[str, Any]:
 
 
 def _safe_source_from_context(c: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build the 'sources' item safely even if metadata isn't the shape we expect.
-    Preserves the existing output format (file/s3_key/chunk).
-    """
     meta = _safe_meta(c.get("meta"))
-
-    file_val = meta.get("file")
-    s3_key_val = meta.get("s3_key")
-    chunk_val = meta.get("chunk")
-
-    return {"file": file_val, "s3_key": s3_key_val, "chunk": chunk_val}
+    return {"file": meta.get("file"), "s3_key": meta.get("s3_key"), "chunk": meta.get("chunk")}
 
 
 def _handle_post_runbooks_ask(event: dict) -> dict:
@@ -759,9 +785,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     except ValueError as e:
         return json_response(event, 400, {"error": {"code": "BAD_REQUEST", "message": str(e)}})
-    #except Exception as e:
-        ## Keep the same error envelope you already had
-    #    return json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
     except Exception as e:
         print("UNHANDLED EXCEPTION:\n" + traceback.format_exc())
         return json_response(event, 500, {"error": {"code": "UNHANDLED", "message": str(e)}})
